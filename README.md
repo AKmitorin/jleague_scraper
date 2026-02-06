@@ -1,4 +1,4 @@
-# jleague\_scra# jleague_scraper
+# jleague_scraper
 
 [Jリーグ公式サイト](https://www.jleague.jp)から選手の個人スタッツを取得し、Excelで開きやすい形式のCSVに出力するPythonツールです。  
 チーム単位だけでなく、リーグ全体の全選手データの取得にも対応しています。
