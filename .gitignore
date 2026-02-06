@@ -1,0 +1,6 @@
+venv/*
+output/*
+
+find_teams.py
+test_fetch.py
+
