@@ -210,11 +210,11 @@ def fetch_stat(stat_type, year, category, team):
     
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT)
-        if response.status_code != 200:
-            return pd.DataFrame(columns=["player_url", "player_name", "team_name", stat_type])
-    except Exception as e:
-        print(f"  Error fetching {stat_type} for {team}: {e}")
-        return pd.DataFrame(columns=["player_url", "player_name", "team_name", stat_type])
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"  {team}の{stat_type}を取得する際にエラーが発生しました: {e}")
+        print("ヒント：入力内容（チーム名・年度など）を確認してください")
+        raise
 
     soup = BeautifulSoup(response.text, "html.parser")
     rows = []
