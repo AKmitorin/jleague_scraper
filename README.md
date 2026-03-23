@@ -3,11 +3,22 @@
 [Jリーグ公式サイト](https://www.jleague.jp)から選手の個人スタッツを取得し、Excelで開きやすい形式のCSVに出力するPythonツールです。  
 チーム単位だけでなく、リーグ全体の全選手データの取得にも対応しています。
 
-## 想定ユーザー
+## まずは最短で動かす（Windows向け）
 
-- Jリーグのデータを分析したい人
-- Pythonでスクレイピングを試してみたい人
-- Excelやスプレッドシートで選手データを扱いたい人
+1. Pythonをインストール（未導入の場合）  
+2. 任意のフォルダで以下を1行ずつ実行
+
+```shell
+git clone https://github.com/AKmitorin/jleague_scraper
+cd jleague_scraper
+pip install -r requirements.txt
+py main.py
+```
+
+引数なしで実行すると、対話式ウィザードが起動します。質問に答えるだけでOKです。
+Mac・Linuxを使用している方は、 `py` コマンドを `python3` に置き換えてください。以下で紹介する使い方についても同様です。
+
+Windowsではエクスプローラー上で `run_windows.bat` をダブルクリックしても起動できます。
 
 ---
 
@@ -44,18 +55,26 @@ pip install -r requirements.txt
 
 ## 使い方
 
-基本形：
-
-```bash
-python jleague_stats_collector.py --year 2025 --category j1 --team shimizu --output output
-```
-
-引数を省略した場合は、2025年・J1・清水エスパルスのデータを取得します（作者の趣味です）。
-
-### Windowsの場合
+### 対話式ウィザード（初心者向け）
 
 ```shell
-py jleague_stats_collector.py --year 2025 --category j1 --team shimizu --output output
+py main.py
+```
+
+※ 途中で `all` を選ぶと全チーム取得となり、10〜15分程度かかる場合があります。
+
+### 引数指定
+
+```shell
+py main.py --year 2025 --category j1 --team shimizu --output output
+```
+
+※ 引数なしで実行した場合は対話式ウィザードが起動します。引数ありのときに省略した値は上記のデフォルトが使われます。
+
+#### チーム一覧を表示
+
+```shell
+py main.py --list-teams --year 2025 --category j1
 ```
 
 ## パラメータ
@@ -66,6 +85,8 @@ py jleague_stats_collector.py --year 2025 --category j1 --team shimizu --output 
 | `--category` | カテゴリ（j1 / j2 / j3） |	`j1` | `j2` |
 | `--team` | チームの英名（または `all`） | `shimizu` | `kashima`, `urawa` |
 | `--output` | 保存先ディレクトリ | `output` | `my_data` |
+| `--interactive` | 対話式ウィザードで実行 | なし | - |
+| `--list-teams` | チーム一覧を表示して終了 | なし | - |
 
 ## 出力ファイル
 
@@ -111,11 +132,17 @@ https://www.jleague.jp/stats/{j1|j2|j3}/player/{year}/{team_id}/{stats_category}
 
 ## 注意事項
 
-- 本ツールはJリーグ公式サイトのHTML構造に依存しています。サイトの変更により動作しなくなる可能性があります。
+- 本ツールは[Jリーグ公式サイト](https://www.jleague.jp)のHTML構造に依存しています。サイトの変更により動作しなくなる可能性があります。
 - サーバーへの負荷を抑えるため、各項目の取得間に待機時間を設けています。
-- --team all 実行時は全チームを巡回するため、10〜15分程度かかる場合があります。
+- `--team all` 実行時は全チームを巡回するため、10〜15分程度かかる場合があります。
 
-ライセンス
+## よくある失敗
+
+- `py`, `python3` コマンドが動かない  
+  Pythonがインストールされていない可能性があります。Python 3.12以上を入れてから再実行してください。
+- `チーム一覧の取得に失敗しました`  
+  ネットワークが不安定な場合に発生します。時間をおいて再実行してください。
+
+## ライセンス
 
 MIT License
-

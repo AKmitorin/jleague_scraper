@@ -5,6 +5,10 @@ import time
 import re
 import argparse
 import os
+import sys
+
+# HTTP request timeout (connect, read) in seconds
+REQUEST_TIMEOUT = (5, 20)
 
 # 統計項目のコードから日本語名（単位）へのマッピング
 STAT_NAME_MAP = {
@@ -96,11 +100,21 @@ def get_team_list(year, category):
     """指定された年とカテゴリのチームスラッグ一覧を取得する"""
     url = f"https://www.jleague.jp/stats/{category}/player/{year}/all/score/"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        options = soup.find_all("option")
+        # "クラブを選択してください" を含む select を特定してから option を取得する
         teams = []
+        target_select = None
+        for sel in soup.find_all("select"):
+            if sel.find("option", string=lambda s: s and "クラブを選択してください" in s):
+                target_select = sel
+                break
+
+        if not target_select:
+            return []
+
+        options = target_select.find_all("option")
         found_club_label = False
         for opt in options:
             val = opt.get("value", "")
@@ -117,11 +131,85 @@ def get_team_list(year, category):
         print(f"Error fetching team list: {e}")
         return []
 
+def prompt_input(message, default=None):
+    """入力プロンプト。空入力ならデフォルトを返す。"""
+    if default is not None:
+        prompt = f"{message} [{default}]: "
+    else:
+        prompt = f"{message}: "
+    value = input(prompt).strip()
+    return value if value else (default if default is not None else "")
+
+def prompt_yes_no(message, default="y"):
+    """Yes/No入力を受け付ける。"""
+    default = default.lower()
+    suffix = "Y/n" if default == "y" else "y/N"
+    while True:
+        raw = input(f"{message} ({suffix}): ").strip().lower()
+        if not raw:
+            return default == "y"
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("  入力が不正です。y か n を入力してください。")
+
+def interactive_wizard():
+    """対話式ウィザードで実行パラメータを収集する。"""
+    print("\n=== Jリーグ 選手スタッツ 取得ウィザード ===")
+    print("いくつか質問に答えるだけで実行できます。\n")
+
+    # 年
+    while True:
+        year = prompt_input("取得したいシーズン（4桁）", "2025")
+        if re.fullmatch(r"\d{4}", year):
+            break
+        print("  4桁の数字（例: 2025）で入力してください。")
+
+    # カテゴリ
+    while True:
+        category = prompt_input("カテゴリ（j1 / j2 / j3）", "j1").lower()
+        if category in ("j1", "j2", "j3"):
+            break
+        print("  j1 / j2 / j3 のいずれかを入力してください。")
+
+    # チーム
+    print("\nチーム候補を取得しています...")
+    team_candidates = get_team_list(year, category)
+    if team_candidates:
+        print(f"  取得できたチーム数: {len(team_candidates)}")
+        print("  例: " + ", ".join(team_candidates[:10]) + (" ..." if len(team_candidates) > 10 else ""))
+        print("  'all' を入力するとリーグ全体の全チームを取得します。")
+    else:
+        print("  チーム候補の取得に失敗しました。手入力で進めます。")
+
+    while True:
+        default_team = "shimizu"
+        team = prompt_input("チームスラッグ（例: shimizu / kashima / all）", default_team).lower()
+        if team == "all":
+            print("  all は全チーム取得のため、10〜15分程度かかる場合があります。")
+            if prompt_yes_no("実行しますか？", default="n"):
+                break
+            print("  チーム指定に戻ります。")
+            continue
+        if team_candidates and team not in team_candidates:
+            print("  候補にないチームです。もう一度入力してください。")
+            continue
+        if team:
+            break
+        print("  チームを入力してください。")
+
+    # 出力先
+    output = prompt_input("保存先フォルダ", "output")
+
+    print("\n入力内容を確認しました。これから取得を開始します。\n")
+    return year, category, team, output
+
 def fetch_stat(stat_type, year, category, team):
     url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{stat_type}/"
     
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=REQUEST_TIMEOUT)
         if response.status_code != 200:
             return pd.DataFrame(columns=["player_url", "player_name", "team_name", stat_type])
     except Exception as e:
@@ -224,7 +312,11 @@ def collect_team_stats(year, category, team, output_dir="output"):
     final_df = master_df.copy()
     
     for i, st in enumerate(stat_types):
-        print(f"[{i+1}/{len(stat_types)}] Fetching {st}...{' ' * 20}", end="\r")
+        message = f"[{i+1}/{len(stat_types)}] データ取得中: {st}..."
+        # 前の行が長い場合に残らないよう、行をクリアしてから表示
+        sys.stdout.write("\r" + " " * 100 + "\r")
+        sys.stdout.write(message)
+        sys.stdout.flush()
         df = fetch_stat(st, year, category, team)
         
         if df.empty:
@@ -234,7 +326,7 @@ def collect_team_stats(year, category, team, output_dir="output"):
         # マージ用にカラムを絞る（URLはマスタにあるので不要、名前とチーム名で結合）
         # ただし、結合用キー以外はスタッツ値だけにする
         cols_to_use = ["player_name", "team_name", st]
-        df_to_merge = df[cols_to_use]
+        df_to_merge = df[cols_to_use].drop_duplicates(subset=["player_name", "team_name"])
         
         # 左結合 (Left Join)
         # これにより、マスタにいない「謎の行」が増えるのを防ぐ
@@ -250,19 +342,42 @@ def collect_team_stats(year, category, team, output_dir="output"):
         
         time.sleep(0.3)
     
-    print(f"\nCompleted fetching all stats for {team}.")
+    print(f"\n全スタッツの取得が完了しました: {team}")
     return final_df
 
 def main():
     parser = argparse.ArgumentParser(description="J.League Player Stats Collector")
-    parser.add_argument("--year", default="2025", help="Season year")
-    parser.add_argument("--category", default="j1", choices=["j1", "j2", "j3"], help="League category")
-    parser.add_argument("--team", default="shimizu", help="Team slug or 'all' for league-wide")
-    parser.add_argument("--output", default="output", help="Output directory")
+    parser.add_argument("--year", default="2025", help="取得したいシーズン（例: 2025）")
+    parser.add_argument("--category", default="j1", choices=["j1", "j2", "j3"], help="カテゴリ（j1 / j2 / j3）")
+    parser.add_argument("--team", default="shimizu", help="チームスラッグ（例: shimizu / kashima / all）")
+    parser.add_argument("--output", default="output", help="保存先フォルダ（例: output）")
+    parser.add_argument("--interactive", action="store_true", help="対話式ウィザードで実行する")
+    parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
     
     args = parser.parse_args()
+
+    # 引数なし、または対話式指定ならウィザードを起動
+    if args.interactive or len(sys.argv) == 1:
+        year, category, team, output = interactive_wizard()
+        args.year = year
+        args.category = category
+        args.team = team
+        args.output = output
+
+    if args.list_teams:
+        teams = get_team_list(args.year, args.category)
+        if teams:
+            print(f"チーム一覧（{args.year} {args.category}）:")
+            print(", ".join(teams))
+        else:
+            print("チーム一覧の取得に失敗しました。")
+        return
     
     if args.team == "all":
+        print("all は全チーム取得のため、10〜15分程度かかる場合があります。")
+        if not prompt_yes_no("実行しますか？", default="n"):
+            print("キャンセルしました。")
+            return
         teams = get_team_list(args.year, args.category)
         print(f"Found {len(teams)} teams for {args.year} {args.category}: {', '.join(teams)}")
         
