@@ -3,7 +3,7 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import time
 from email.utils import parsedate_to_datetime
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import argparse
 import os
@@ -11,6 +11,33 @@ import sys
 
 # HTTP request timeout (connect, read) in seconds
 REQUEST_TIMEOUT = (5, 20)
+
+# リトライ対象とするリトライ回数
+MAX_RETRIES = 3
+
+# リトライ間の基本待機秒数（指数バックオフ）
+RETRY_BACKOFF_BASE = 2
+
+# サーバー負荷軽減のため、リクエスト間の固定待機秒数
+REQUEST_INTERVAL = 0.5
+
+# 同一セッションでリクエストを実行するための Session
+_session = None
+
+
+def _get_session():
+    """requests.Session をシングルトンで取得する。接続再利用によりTLSハンドシェイクを省略できる。"""
+    global _session
+    if _session is None:
+        _session = requests.Session()
+        _session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "ja,en;q=0.8",
+        })
+    return _session
 
 # 統計項目のコードから日本語名（単位）へのマッピング
 STAT_NAME_MAP = {
@@ -102,7 +129,7 @@ def get_team_list(year, category):
     """指定された年とカテゴリのチームスラッグ一覧を取得する"""
     url = f"https://www.jleague.jp/stats/{category}/player/{year}/all/score/"
     try:
-        response = requests.get(url, timeout=REQUEST_TIMEOUT)
+        response = _get_session().get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
         # "クラブを選択してください" を含む select を特定してから option を取得する
@@ -114,6 +141,12 @@ def get_team_list(year, category):
                 break
 
         if not target_select:
+            # チーム候補を動的に取得できなかった場合、呼び出し側が区別できるよう
+            # 警告を出した上で空リストを返す
+            print(
+                f"警告: チーム一覧のHTML構造が見つかりませんでした (URL: {url})。"
+                "サイトの構造変更が考えられます。"
+            )
             return []
 
         options = target_select.find_all("option")
@@ -129,9 +162,31 @@ def get_team_list(year, category):
                     break
                 teams.append(val)
         return teams
-    except Exception as e:
-        print(f"Error fetching team list: {e}")
+    except requests.exceptions.RequestException as e:
+        # ネットワークエラーとHTTPエラーを区別して報告する
+        print(f"チーム一覧の取得に失敗しました（ネットワークまたはHTTPエラー）: {e}")
         return []
+    except Exception as e:
+        print(f"チーム一覧の解析中に予期しないエラーが発生しました: {e}")
+        return []
+
+def _normalize_year(value):
+    """シーズン文字列を正規化する。全角数字は半角に変換する。
+
+    旧実装は `re.fullmatch(r"\\d{4}", year)` だけで検証しており、全角数字
+    （"２０２５"）も受理していた。その結果、URLに全角を含むことになって
+    取得が静かに失敗していた。
+    """
+    text = str(value).strip()
+    # 全角数字を半角に変換
+    text = text.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+    return text
+
+
+def _is_valid_year(value):
+    """4桁のシーズンとして妥当かを判定する（半角数字のみ受理）。"""
+    return re.fullmatch(r"[0-9]{4}", _normalize_year(value)) is not None
+
 
 def prompt_input(message, default=None):
     """入力プロンプト。空入力ならデフォルトを返す。"""
@@ -164,9 +219,10 @@ def interactive_wizard():
     # 年
     while True:
         year = prompt_input("取得したいシーズン（4桁）", "2025")
-        if re.fullmatch(r"\d{4}", year):
+        year = _normalize_year(year)
+        if _is_valid_year(year):
             break
-        print("  4桁の数字（例: 2025）で入力してください。")
+        print("  4桁の半角数字（例: 2025）で入力してください。")
 
     # カテゴリ
     while True:
@@ -207,48 +263,128 @@ def interactive_wizard():
     print("\n入力内容を確認しました。これから取得を開始します。\n")
     return year, category, team, output
 
+def _parse_retry_after(headers):
+    """Retry-Afterヘッダの値から待機秒数を返す。
+
+    秒数形式（"120"）とHTTP-date形式（"Wed, 21 Oct 2026 07:28:00 GMT"）の両方に対応する。
+    パースできない場合はNoneを返す（呼び出し側でフォールバックする）。
+    """
+    retry_after = headers.get("Retry-After")
+    if not retry_after:
+        return None
+
+    retry_after = retry_after.strip()
+
+    # 秒数形式
+    if retry_after.isdigit():
+        return int(retry_after)
+
+    # HTTP-date形式
+    try:
+        dt = parsedate_to_datetime(retry_after)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+        # すでに過ぎている場合は即リトライしてよい
+        return max(0, int(seconds))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _request_with_retry(url, context="", max_retries=MAX_RETRIES):
+    """GETリクエストをリトライ付きで実行する。成功時はレスポンスを返す。
+
+    リトライ対象:
+      - 429 Too Many Requests（Retry-Afterヘッダがあれば従う）
+      - 5xx サーバーエラー（指数バックオフ）
+      - タイムアウト / 接続エラー（指数バックオフ）
+
+    旧実装には「全試行がタイムアウトだと response が未代入のまま参照され
+    UnboundLocalError になる」「429のレスポンスをデータとして解析する」といった
+    不具合があった。ループが確実に response を返すよう構造を改めた。
+    """
+    session = _get_session()
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        exhausted = attempt >= max_retries
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+
+            # 429 Too Many Requests
+            if response.status_code == 429:
+                if exhausted:
+                    last_error = "429 Too Many Requests（リトライ上限に到達）"
+                    break
+                wait_seconds = _parse_retry_after(response.headers)
+                if wait_seconds is None:
+                    wait_seconds = RETRY_BACKOFF_BASE ** attempt
+                print(
+                    f"  [429] {context} レート制限。{wait_seconds}秒待機して再試行します "
+                    f"({attempt}/{max_retries})"
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            # 5xx サーバーエラー
+            if 500 <= response.status_code < 600:
+                if exhausted:
+                    last_error = f"HTTP {response.status_code}"
+                    break
+                wait_seconds = RETRY_BACKOFF_BASE ** attempt
+                print(
+                    f"  [HTTP {response.status_code}] {context} "
+                    f"{wait_seconds}秒待機して再試行します ({attempt}/{max_retries})"
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            # 2xx もしくは 4xx（429以外のクライアントエラーは即エラー）
+            response.raise_for_status()
+            return response
+
+        except requests.exceptions.Timeout:
+            last_error = "タイムアウト"
+            if exhausted:
+                break
+            wait_seconds = RETRY_BACKOFF_BASE ** attempt
+            print(
+                f"  [Timeout] {context} {wait_seconds}秒待機して再試行します "
+                f"({attempt}/{max_retries})"
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        except requests.exceptions.RequestException as e:
+            # 429/5xxは上で処理済みなので、ここではその他のリクエスト例外を処理する
+            # （ConnectionError, HTTPError などのサブクラスも含む）
+            last_error = str(e)
+            if exhausted:
+                break
+            wait_seconds = RETRY_BACKOFF_BASE ** attempt
+            print(
+                f"  [Error] {context} {wait_seconds}秒待機して再試行します "
+                f"({attempt}/{max_retries}): {e}"
+            )
+            time.sleep(wait_seconds)
+            continue
+
+    # すべての試行が失敗した場合
+    raise requests.exceptions.RequestException(
+        f"{context} リクエストが{max_retries}回の試行後も成功しませんでした（最後の原因: {last_error}）"
+    )
+
+
 def fetch_stat(stat_type, year, category, team, strict=False):
     url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{stat_type}/"
-    
-    # リトライ対象：
-    # - 429 Too Many Requests（リトライ回数上限は最大3回。Retry-Afterヘッダがあれば従う）
-    # 将来的にTimeoutなども追加したい
 
-    # 429対策：最大3回リトライ。Retry-Afterがあれば従う
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+    # サーバー負荷軽減のため、固定待機を入れる
+    time.sleep(REQUEST_INTERVAL)
 
-            if response.status_code == 429:
-                if attempt < max_retries:
-                    retry_after = response.headers.get("Retry-After")
-                    wait_seconds = 1
-                    if retry_after:
-                        try:
-                            if retry_after.isdigit():
-                                wait_seconds = int(retry_after)
-                        except Exception:
-                            wait_seconds = 1
-                    if attempt == max_retries - 1:
-                        raise Exception("リトライ回数上限に達しました")
-                    print(f"  429 Too Many Requests. {wait_seconds}秒待機して再試行します ({attempt+1}/{max_retries})")
-                    time.sleep(wait_seconds)
-                    continue
-
-            response.raise_for_status() # 429以外のHTTPエラーもここでキャッチ
-            break
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1: # リトライ回数が残っていればリトライ
-                print(f"  タイムアウトが発生しました。再試行します ({attempt+1}/{max_retries})")
-                time.sleep(2)  # タイムアウト時は少し長めに待機←サーバーや通信が遅くなっている可能性があるため
-                continue
-        except requests.exceptions.RequestException as e:                
-            print(f"  {team}の{stat_type}を取得する際にエラーが発生しました: {e}")
-            print("ヒント：入力内容（チーム名・年度など）を確認してください")
-            raise
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    context = f"{team}の{stat_type}"
+    response = _request_with_retry(url, context=context)
+    html = response.text
+    soup = BeautifulSoup(html, "html.parser")
     rows = []
     
     ranking_list = soup.find("ul", class_="ranking_list")
@@ -314,89 +450,161 @@ def _normalize_player_url(df):
         df["player_url"] = df["player_url"].fillna("").astype(str)
     return df
 
+
 def _dedupe_players(df):
-    """player_url優先で一意化。URLなしは名前+チームで一意化する。"""
+    """選手を一意化する。
+
+    優先順位:
+      1. player_url があるものを採用する
+      2. player_url がない場合は 名前 + チーム名 で一意化する
+
+    旧実装は「URLあり」と「URLなし」の行を別々に drop_duplicates してから
+    結合していたため、同一選手（例: game ページにはURLあり、score ページにはURLなし）
+    が2行残っていた。フェーズごとのURLの有無が食い違うことは実際に 일어나るため、
+    ここでは URL 優先でまとめたうえで、名前+チームが一致する行は同一選手として扱う。
+    """
+    if df.empty:
+        return df.reset_index(drop=True)
+
     df = _normalize_player_url(df.copy())
-    with_url = df[df["player_url"] != ""].drop_duplicates(subset=["player_url"])
-    without_url = df[df["player_url"] == ""].drop_duplicates(subset=["player_name", "team_name"])
-    return pd.concat([with_url, without_url], ignore_index=True)
+
+    # チーム名が欠損している場合は、結合キーが壊れないように空文字へ寄せる
+    if "team_name" in df.columns:
+        df["team_name"] = df["team_name"].fillna("").astype(str)
+    if "player_name" in df.columns:
+        df["player_name"] = df["player_name"].fillna("").astype(str)
+
+    # 1) URL が一意に決まる行を確定（同名選手でもURLが違えば別人とみなす）
+    with_url = df[df["player_url"] != ""].drop_duplicates(subset=["player_url"], keep="first")
+
+    # 2) URL がない行は、名前+チームで一意化する
+    without_url = df[df["player_url"] == ""]
+    if not without_url.empty:
+        without_url = without_url.drop_duplicates(subset=["player_name", "team_name"], keep="first")
+
+    if with_url.empty:
+        return without_url.reset_index(drop=True)
+    if without_url.empty:
+        return with_url.reset_index(drop=True)
+
+    # 3) 名前+チームが一致する「URLなし」行は、既存の「URLあり」行と同一選手とみなす
+    known_keys = set(zip(with_url["player_name"], with_url["team_name"]))
+    absorbed_mask = without_url.apply(
+        lambda r: (r["player_name"], r["team_name"]) in known_keys, axis=1
+    )
+    absorbed = without_url[absorbed_mask]
+    if not absorbed.empty:
+        print(
+            f"  注意: {len(absorbed)}件の.URLなし行が同一選手のURLあり行と重複したため、"
+            "URLあり行に統合しました。"
+        )
+
+    kept_without_url = without_url[~absorbed_mask]
+    merged = pd.concat([with_url, kept_without_url], ignore_index=True)
+    return merged.reset_index(drop=True)
 
 def _merge_stat_by_key(final_df, df_stat, stat_col):
-    """player_url優先で結合。URLなしは名前+チームで結合する。"""
+    """player_url優先で結合。URLなしは名前+チームで結合する。
+
+    該当する行が見つからない場合は 0 で埋める。元の行を取りこぼさない。
+    旧実装は空DataFrameに `df[col] = []` を代入しており、意味のない列を作っていた。
+    """
     final_df = _normalize_player_url(final_df.copy())
     df_stat = _normalize_player_url(df_stat.copy())
 
     final_with_url = final_df[final_df["player_url"] != ""].copy()
     final_without_url = final_df[final_df["player_url"] == ""].copy()
 
-    stat_with_url = df_stat[df_stat["player_url"] != ""][["player_url", stat_col]].drop_duplicates(subset=["player_url"])
-    stat_without_url = df_stat[df_stat["player_url"] == ""][["player_name", "team_name", stat_col]].drop_duplicates(subset=["player_name", "team_name"])
+    stat_with_url = (
+        df_stat[df_stat["player_url"] != ""][["player_url", stat_col]]
+        .drop_duplicates(subset=["player_url"])
+    )
+    stat_without_url = (
+        df_stat[df_stat["player_url"] == ""][["player_name", "team_name", stat_col]]
+        .drop_duplicates(subset=["player_name", "team_name"])
+    )
 
+    parts = []
     if not final_with_url.empty:
-        final_with_url = pd.merge(final_with_url, stat_with_url, on="player_url", how="left")
-    else:
-        final_with_url[stat_col] = []
+        merged_with = pd.merge(final_with_url, stat_with_url, on="player_url", how="left")
+        merged_with[stat_col] = merged_with[stat_col].fillna(0)
+        parts.append(merged_with)
 
     if not final_without_url.empty:
-        final_without_url = pd.merge(final_without_url, stat_without_url, on=["player_name", "team_name"], how="left")
-    else:
-        final_without_url[stat_col] = []
+        merged_without = pd.merge(
+            final_without_url, stat_without_url, on=["player_name", "team_name"], how="left"
+        )
+        merged_without[stat_col] = merged_without[stat_col].fillna(0)
+        parts.append(merged_without)
 
-    merged = pd.concat([final_with_url, final_without_url], ignore_index=True)
-    merged[stat_col] = merged[stat_col].fillna("0")
-    return merged
+    if not parts:
+        # 元データが行がない場合は、列のみを持つ空DataFrameを返す
+        empty = final_df.copy()
+        empty[stat_col] = pd.Series(dtype="object")
+        return empty
+
+    return pd.concat(parts, ignore_index=True)
 
 def collect_team_stats(year, category, team, output_dir="output", strict=False):
     stat_types = list(STAT_NAME_MAP.keys())
     print(f"--- Target: {year} {category} {team} ---")
-    
+
     # --- Step 1: 選手マスタ（ベース）の作成 ---
     # 'game'（出場試合数）と 'score'（得点）を取得して、全選手リストを作成する
     print("Creating player master list...")
     base_stats = ["game", "score"]
     master_df = None
     base_stats_cache = {}
-    
+
     for st in base_stats:
         df = fetch_stat(st, year, category, team, strict=strict)
         if df is None or df.empty:
             url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{st}/"
             raise RuntimeError(f"{team}の{st}ランキング取得失敗 (URL: {url})")
         base_stats_cache[st] = df
-        
+
         # 必要な基本カラムだけ抽出
         df_base = df[["player_url", "player_name", "team_name"]].copy()
-        
+
         if master_df is None:
             master_df = df_base
         else:
-            # マージして選手リストを統合（URLなし選手も名前とチーム名で統合）
-            # URLが空の場合は、空でない方を優先して採用するロジックが必要だが、
-            # 単純に結合してから重複排除する
+            # 選手リストを統合する。重複排除は最後にまとめて行う。
             master_df = pd.concat([master_df, df_base], ignore_index=True)
-    
+
     if master_df is None or master_df.empty:
         raise RuntimeError(f"{team}の選手マスタ作成に失敗しました (URL: https://www.jleague.jp/stats/{category}/player/{year}/{team}/game/)")
 
     # 重複排除（マスタ作成）
-    # player_url優先で一意化し、URLが無い場合は名前+チームで一意化
+    # player_url優先で一意化し、URLが無い場合は名前+チームで一意化する
     master_df = _dedupe_players(master_df)
-    
+
     print(f"Master list created: {len(master_df)} players found.")
 
     # --- Step 2: 全スタッツを左結合していく ---
     final_df = master_df.copy()
-    
+    failed_stats = []
+
     for i, st in enumerate(stat_types):
         message = f"[{i+1}/{len(stat_types)}] データ取得中: {st}..."
         # 前の行が長い場合に残らないよう、行をクリアしてから表示
         sys.stdout.write("\r" + " " * 100 + "\r")
         sys.stdout.write(message)
         sys.stdout.flush()
+
         if st in base_stats_cache:
             df = base_stats_cache[st]
         else:
-            df = fetch_stat(st, year, category, team, strict=strict)
+            try:
+                df = fetch_stat(st, year, category, team, strict=strict)
+            except requests.exceptions.RequestException as e:
+                # ネットワークエラーは当該項目だけを失敗として扱い、全体は継続する
+                if strict:
+                    raise
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                print(f"  [取得失敗] {st}: {e}")
+                df = None
+                failed_stats.append(st)
 
         if df is None or df.empty:
             url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{st}/"
@@ -404,24 +612,40 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
                 raise RuntimeError(f"{team}の{st}ランキング取得失敗 (URL: {url})")
             else:
                 # 非strictは0埋めで継続
-                final_df[st] = "0"
+                if st not in failed_stats:
+                    sys.stdout.write("\r" + " " * 100 + "\r")
+                    print(f"  [取得失敗] {st} のランキングが空です (URL: {url})")
+                    failed_stats.append(st)
+                final_df[st] = 0
                 continue
-        
+
         # マージ用にカラムを絞る（URLはマスタにあるので不要、名前とチーム名で結合）
         # ただし、結合用キー以外はスタッツ値だけにする
         cols_to_use = ["player_url", "player_name", "team_name", st]
         df_to_merge = _dedupe_players(df[cols_to_use])
-        
+
         # 左結合 (Left Join)
         # これにより、マスタにいない「謎の行」が増えるのを防ぐ
         try:
             final_df = _merge_stat_by_key(final_df, df_to_merge, st)
-            
         except Exception as e:
-            print(f"\n  Warning: Could not merge {st}: {e}")
-            final_df[st] = "0"
-        
-    
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            print(f"  [警告] {st} の結合に失敗しました: {e}")
+            final_df[st] = 0
+            failed_stats.append(st)
+
+    if failed_stats:
+        sys.stdout.write("\r" + " " * 100 + "\r")
+        print(
+            f"  注意: {len(failed_stats)}/{len(stat_types)} 項目を取得できませんでした。"
+            "該当列は 0 で埋めています: " + ", ".join(failed_stats)
+        )
+        if not strict:
+            print(
+                "        実際の値が 0 の選手と区別できません。"
+                "--strict を付けると取得失敗時に中断します。"
+            )
+
     print(f"\n全スタッツの取得が完了しました: {team}")
     return final_df
 
@@ -436,6 +660,13 @@ def main():
     parser.add_argument("--strict", action="store_true", help="厳格モード（ランキングが見つからない場合は例外で中断）")
     
     args = parser.parse_args()
+
+    # CLI引数の --year も正規化する（全角数字→半角変換 + 妥当性検証）
+    args.year = _normalize_year(args.year)
+    if not _is_valid_year(args.year):
+        parser.error(
+            f"--year は4桁の半角数字で指定してください（入力値: {args.year!r}）"
+        )
 
     # 引数なし、または対話式指定ならウィザードを起動
     if args.interactive or len(sys.argv) == 1:
@@ -460,19 +691,39 @@ def main():
             print("キャンセルしました。")
             return
         teams = get_team_list(args.year, args.category)
+        if not teams:
+            print("チーム一覧が取得できなかったため、処理を中止します。")
+            return
         print(f"Found {len(teams)} teams for {args.year} {args.category}: {', '.join(teams)}")
-        
+
         all_teams_df = []
+        failed_teams = []
         for i, t in enumerate(teams):
             print(f"\n[Team {i+1}/{len(teams)}] Processing {t}...")
-            team_df = collect_team_stats(args.year, args.category, t, args.output, strict=args.strict)
+            # 1チームの失敗で全体が止まると、それまでに取得したデータが
+            # すべて破棄されてしまうため、チーム単位でエラーを隔離する
+            try:
+                team_df = collect_team_stats(
+                    args.year, args.category, t, args.output, strict=args.strict
+                )
+            except Exception as e:
+                print(f"  [チーム失敗] {t}: {e}")
+                failed_teams.append(t)
+                continue
+
             if team_df is not None and not team_df.empty:
                 all_teams_df.append(team_df)
-        
+
+        if failed_teams:
+            print(
+                f"\n警告: {len(failed_teams)}/{len(teams)} チームで失敗しました: "
+                + ", ".join(failed_teams)
+            )
+
         if not all_teams_df:
             print("No data collected for any team.")
             return
-            
+
         final_df = pd.concat(all_teams_df, ignore_index=True)
         # 最後に全体で重複排除（念のため）
         final_df = _dedupe_players(final_df)
@@ -483,12 +734,18 @@ def main():
         print("No data collected.")
         return
 
-    final_df = final_df.fillna("0")
-    # 数値列は数値型に統一する
+    # 数値列は数値型に統一する。
+    # 旧実装は DataFrame 全体を fillna("0") していたため、player_url の欠損が
+    # 文字列 "0" になって出力されていた。ここでは統計列だけを処理する。
     for st in STAT_NAME_MAP.keys():
         if st in final_df.columns:
             final_df[st] = pd.to_numeric(final_df[st], errors="coerce").fillna(0)
-    
+
+    # 文字列列の欠損は空文字にする（URLに "0" が入るのを防ぐ）
+    for col in ("player_url", "player_name", "team_name"):
+        if col in final_df.columns:
+            final_df[col] = final_df[col].fillna("").astype(str)
+
     rename_map = {
         "player_url": "選手URL",
         "player_name": "選手名",
