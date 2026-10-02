@@ -750,7 +750,9 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
             fetch_error = None
         except (requests.exceptions.RequestException, RuntimeError) as e:
             player_stats = {
-                key: (0 if _is_stat_applicable(key, player.get("position", "")) else None)
+                # 取得できなかった値を実績ゼロと区別する。ランキングや補完値で
+                # 後から取得できた項目は、この None が実値に置き換わる。
+                key: None
                 for key in STAT_NAME_MAP
             }
             source_type = "未取得"
@@ -1150,7 +1152,21 @@ def main():
     with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow([label for _, label in columns])
-        writer.writerows([[row.get(key) for key, _ in columns] for row in final_df])
+        def csv_value(row, key):
+            value = row.get(key)
+            if key in STAT_NAME_MAP and value is None:
+                # ポジションの対象外項目は空欄、対象項目の未取得値はハイフン。
+                if (
+                    _is_stat_applicable(key, row.get("_position", ""))
+                    and not (args.category in ("j2", "j3") and key in J1_ONLY_PHYSICAL_STAT_KEYS)
+                ):
+                    return "-"
+            return value
+
+        writer.writerows([
+            [csv_value(row, key) for key, _ in columns]
+            for row in final_df
+        ])
     print(f"\nSUCCESS: Saved to {filepath}")
     print(f"Total players: {len(final_df)}")
     return
