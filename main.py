@@ -523,8 +523,18 @@ def _fetch_player_roster(year, category, team):
     return players
 
 
-def _fetch_player_appearances(player_id, season):
-    """個人ページの全シーズン履歴から指定シーズンの出場試合数を数える。"""
+PLAYER_HISTORY_STAT_KEYS = {
+    "game": "出場試合数",
+    "time": "出場時間",
+    "score": "得点",
+    "shoot": "シュート数",
+    "yellow_count": "警告数",
+    "red_count": "退場数",
+}
+
+
+def _fetch_player_history_stats(player_id, season):
+    """個人ページの試合履歴から、指定シーズンの基本スタッツを合算する。"""
     game_kind_id = SEASON_GAME_KIND_IDS[season]
     url = f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats"
     time.sleep(REQUEST_INTERVAL)
@@ -547,19 +557,28 @@ def _fetch_player_appearances(player_id, season):
         r'\\"year\\":(\d+),\\"gameKindId\\":(\d+)',
         history,
     ))
-    appearances = 0
+    stats = {key: 0 for key in PLAYER_HISTORY_STAT_KEYS}
     for index, entry in enumerate(entries):
         record_end = entries[index + 1].start() if index + 1 < len(entries) else len(history)
         record = history[entry.start():record_end]
-        if int(entry.group(1)) != 2026 or int(entry.group(2)) != game_kind_id:
+        if int(entry.group(1)) != int(season[:4]) or int(entry.group(2)) != game_kind_id:
             continue
-        if re.search(r'\\"appearance\\":\\"(?:start|sub)\\"', record):
-            appearances += 1
-    return appearances
+        if not re.search(r'\\"appearance\\":\\"(?:start|sub)\\"', record):
+            continue
+        stats["game"] += 1
+        for key, field in (("time", "minutes"), ("score", "goals"), ("shoot", "shots")):
+            value = re.search(rf'\\"{field}\\":(\d+)', record)
+            if value:
+                stats[key] += int(value.group(1))
+        cards = re.search(r'\\"cards\\":\\"(\d+)/(\d+)\\"', record)
+        if cards:
+            stats["yellow_count"] += int(cards.group(1))
+            stats["red_count"] += int(cards.group(2))
+    return stats
 
 
-def collect_appearances(year, category, team):
-    """公式サイトの選手履歴から、チームの選手別出場試合数を集計する。"""
+def collect_appearances(year, category, team, output_dir="output"):
+    """公式サイトの選手履歴から、チームの選手別基本スタッツを集計する。"""
     if year not in SEASON_GAME_KIND_IDS:
         raise ValueError("出場試合数の集計は 2026 または 2026-27 に対応しています")
 
@@ -572,34 +591,45 @@ def collect_appearances(year, category, team):
         print(f"[{index}/{len(players)}] {player['player_name']} の出場履歴を取得中")
         player_url = f"https://www.jleague.jp/player/{player['player_id']}/?navicode=j1#stats"
         try:
-            appearances = _fetch_player_appearances(player["player_id"], year)
+            player_stats = _fetch_player_history_stats(player["player_id"], year)
             source_type = "選手個人ページ"
             source_url = player_url
         except (requests.exceptions.RequestException, RuntimeError) as e:
             fallback_key = (year, category, team, player["player_id"], "game")
             fallback = fallbacks.get(fallback_key)
+            errors.append((player["player_id"], player["player_name"], str(e)))
             if fallback is None:
-                errors.append((player["player_id"], player["player_name"], str(e)))
-                appearances = None
+                player_stats = {key: 0 for key in PLAYER_HISTORY_STAT_KEYS}
                 source_type = "未取得"
                 source_url = ""
             else:
-                appearances = fallback["value"]
+                player_stats["game"] = fallback["value"]
                 source_type = fallback["source_type"]
                 source_url = fallback["source_url"]
-        rows.append({
+        row = {
             "player_url": player_url,
             "player_name": player["player_name"],
             "team_name": "清水エスパルス" if team == "shimizu" else team,
-            "game": appearances,
             "source_type": source_type,
             "source_url": source_url,
-        })
+        }
+        row.update(player_stats)
+        rows.append(row)
 
     if errors:
-        print(f"注意: {len(errors)}人は履歴を確認できず、出場数を空欄にします:")
+        print(f"注意: {len(errors)}人は履歴を確認できず、取得失敗スタッツは0にします:")
         for player_id, name, error in errors:
             print(f"  {name} ({player_id}): {error}")
+        error_rows = []
+        for player_id, name, error in errors:
+            player_url = f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats"
+            for stat_key, stat_label in PLAYER_HISTORY_STAT_KEYS.items():
+                if stat_key == "game" and (year, category, team, player_id, "game") in fallbacks:
+                    continue
+                error_rows.append((team, name, player_url, stat_label, error))
+        _write_stat_failure_log(output_dir, year, category, team, error_rows)
+        if error_rows:
+            print(f"取得失敗ログ: {os.path.join(output_dir, f'stats_{team}_{year}_{category}_errors.csv')}")
     return rows
 
 def _normalize_player_url(df):
@@ -702,6 +732,18 @@ def _merge_stat_by_key(final_df, df_stat, stat_col):
 
     return pd.concat(parts, ignore_index=True)
 
+
+def _write_stat_failure_log(output_dir, year, category, team, failures):
+    """取得に失敗したスタッツを、通常のCSVとは別のログCSVに記録する。"""
+    if not failures:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(output_dir, f"stats_{team}_{year}_{category}_errors.csv")
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["チーム", "選手名", "選手URL", "項目", "理由"])
+        writer.writerows(failures)
+
 def collect_team_stats(year, category, team, output_dir="output", strict=False):
     stat_types = list(STAT_NAME_MAP.keys())
     print(f"--- Target: {year} {category} {team} ---")
@@ -741,6 +783,7 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
     # --- Step 2: 全スタッツを左結合していく ---
     final_df = master_df.copy()
     failed_stats = []
+    failure_log_rows = []
 
     for i, st in enumerate(stat_types):
         message = f"[{i+1}/{len(stat_types)}] データ取得中: {st}..."
@@ -773,6 +816,11 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
                     sys.stdout.write("\r" + " " * 100 + "\r")
                     print(f"  [取得失敗] {st} のランキングが空です (URL: {url})")
                     failed_stats.append(st)
+                failure_reason = f"ランキング取得失敗 (URL: {url})"
+                failure_log_rows.extend(
+                    (team, row["player_name"], row["player_url"], st, failure_reason)
+                    for _, row in master_df.iterrows()
+                )
                 final_df[st] = 0
                 continue
 
@@ -790,6 +838,10 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
             print(f"  [警告] {st} の結合に失敗しました: {e}")
             final_df[st] = 0
             failed_stats.append(st)
+            failure_log_rows.extend(
+                (team, row["player_name"], row["player_url"], st, f"結合失敗: {e}")
+                for _, row in master_df.iterrows()
+            )
 
     if failed_stats:
         sys.stdout.write("\r" + " " * 100 + "\r")
@@ -802,6 +854,9 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
                 "        実際の値が 0 の選手と区別できません。"
                 "--strict を付けると取得失敗時に中断します。"
             )
+        _write_stat_failure_log(output_dir, year, category, team, failure_log_rows)
+        if failure_log_rows:
+            print(f"  取得失敗ログ: {os.path.join(output_dir, f'stats_{team}_{year}_{category}_errors.csv')}")
 
     print(f"\n全スタッツの取得が完了しました: {team}")
     return final_df
@@ -816,9 +871,9 @@ def main():
     parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
     parser.add_argument("--strict", action="store_true", help="厳格モード（ランキングが見つからない場合は例外で中断）")
     parser.add_argument(
-        "--appearances-only",
+        "--appearances-only", "--player-history-stats",
         action="store_true",
-        help="選手個人ページから出場試合数のみ集計する（2026 / 2026-27、J1）",
+        help="選手個人ページから取得できる基本スタッツを集計する（2026 / 2026-27、J1）",
     )
     
     args = parser.parse_args()
@@ -855,7 +910,7 @@ def main():
         return
 
     if args.appearances_only:
-        final_df = collect_appearances(args.year, args.category, args.team)
+        final_df = collect_appearances(args.year, args.category, args.team, args.output)
         os.makedirs(args.output, exist_ok=True)
         filename = f"stats_{args.team}_{args.year}_{args.category}.csv"
         filepath = os.path.join(args.output, filename)
@@ -863,9 +918,9 @@ def main():
             ("player_url", "選手URL"),
             ("player_name", "選手名"),
             ("team_name", "チーム名"),
-            ("game", STAT_NAME_MAP["game"]),
-            ("source_type", "取得方法"),
-            ("source_url", "出典URL"),
+            *((stat, STAT_NAME_MAP[stat]) for stat in ("game", "time", "score", "shoot", "yellow_count", "red_count")),
+            ("source_type", "出場試合数の取得方法"),
+            ("source_url", "出場試合数の出典URL"),
         ]
         with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.writer(csv_file)
