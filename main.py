@@ -1,5 +1,6 @@
 import requests
 import csv
+import json
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -133,43 +134,45 @@ STAT_NAME_MAP = {
     "un_possession_sprint": "被ポゼッション時のスプリント回数（回）",
 }
 
+# J2・J3の公式選手スタッツでは提供されないフィジカル系項目。
+J1_ONLY_PHYSICAL_STAT_KEYS = {
+    "distance", "top_speed", "sprint", "at_sprint", "mt_sprint", "dt_sprint",
+    "possession_distance", "possession_sprint",
+    "un_possession_distance", "un_possession_sprint",
+}
+
+
+def _stat_keys_for_category(category):
+    if category in ("j2", "j3"):
+        return [key for key in STAT_NAME_MAP if key not in J1_ONLY_PHYSICAL_STAT_KEYS]
+    return list(STAT_NAME_MAP)
+
 def get_team_list(year, category):
-    """指定された年とカテゴリのチームスラッグ一覧を取得する"""
-    url = f"https://www.jleague.jp/stats/{category}/player/{year}/all/score/"
+    """現行の公式スタッツページからクラブ選択肢のスラッグ一覧を取得する。"""
+    url = f"https://www.jleague.jp/{category}/stats/player/{year}/score/search-list/"
     try:
         response = _get_session().get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        # "クラブを選択してください" を含む select を特定してから option を取得する
-        teams = []
-        target_select = None
-        for sel in soup.find_all("select"):
-            if sel.find("option", string=lambda s: s and "クラブを選択してください" in s):
-                target_select = sel
-                break
+        # 現行サイトは select 要素ではなく、Next.js の RSC ペイロードに
+        # id="club" の選択肢を JSON として埋め込んでいる。
+        payload = response.text.replace(r'\"', '"')
+        club_options = re.search(
+            r'"id":"club".*?"id":"club-all".*?"options":(\[.*?\])',
+            payload,
+            re.DOTALL,
+        )
+        if club_options:
+            options = json.loads(club_options.group(1))
+            teams = [option.get("value", "") for option in options]
+            teams = [team for team in teams if team and team != "all"]
+            if teams:
+                return teams
 
-        if not target_select:
-            # チーム候補を動的に取得できなかった場合、呼び出し側が区別できるよう
-            # 警告を出した上で空リストを返す
-            print(
-                f"警告: チーム一覧のHTML構造が見つかりませんでした (URL: {url})。"
-                "サイトの構造変更が考えられます。"
-            )
-            return []
-
-        options = target_select.find_all("option")
-        found_club_label = False
-        for opt in options:
-            val = opt.get("value", "")
-            text = opt.text.strip()
-            if "クラブを選択してください" in text:
-                found_club_label = True
-                continue
-            if found_club_label and val != "all" and val != "":
-                if "シーズンを選択してください" in text or "項目を選択してください" in text:
-                    break
-                teams.append(val)
-        return teams
+        print(
+            f"警告: クラブ一覧データが見つかりません (URL: {url})。"
+            "サイトの構造変更が考えられます。"
+        )
+        return []
     except requests.exceptions.RequestException as e:
         # ネットワークエラーとHTTPエラーを区別して報告する
         print(f"チーム一覧の取得に失敗しました（ネットワークまたはHTTPエラー）: {e}")
@@ -226,11 +229,11 @@ def interactive_wizard():
 
     # 年
     while True:
-        year = prompt_input("取得したいシーズン（4桁）", "2025")
+        year = prompt_input("取得したいシーズン（例: 2025 / 2026-27）", "2026-27")
         year = _normalize_year(year)
-        if _is_valid_year(year):
+        if _is_valid_year(year) or year in SEASON_GAME_KIND_IDS:
             break
-        print("  4桁の半角数字（例: 2025）で入力してください。")
+        print("  4桁の半角数字または 2026-27 を入力してください。")
 
     # カテゴリ
     while True:
@@ -512,15 +515,50 @@ def _fetch_player_roster(year, category, team):
 
     players = []
     seen = set()
-    for player_id, name in re.findall(
+    option_matches = list(re.finditer(
         r'\\"value\\":\\"(\d+)\\",\\"label\\":\\"([^"\\]+)\\"', block
-    ):
+    ))
+    for index, match in enumerate(option_matches):
+        player_id, name = match.groups()
         if player_id not in seen:
-            players.append({"player_id": player_id, "player_name": name})
+            option_end = option_matches[index + 1].start() if index + 1 < len(option_matches) else len(block)
+            option = block[match.start():option_end]
+            position_match = re.search(r'\\"position\\":\\"(GK|DF|MF|FW)\\"', option)
+            players.append({
+                "player_id": player_id,
+                "player_name": name,
+                "position": position_match.group(1) if position_match else "",
+            })
             seen.add(player_id)
     if not players:
         raise RuntimeError(f"選手一覧を解析できません (URL: {url})")
     return players
+
+
+def _fetch_team_stat_ranking(year, category, team, stat):
+    """公式のチーム絞り込みランキングから選手別数値を取得する。"""
+    url = (
+        f"https://www.jleague.jp/{category}/stats/player/"
+        f"{year}/{stat}/search-list/?club={team}"
+    )
+    time.sleep(REQUEST_INTERVAL)
+    response = _request_with_retry(url, context=f"{team}の{stat}ランキング")
+    html = response.text
+    if r'\"rankingList\"' not in html:
+        raise RuntimeError(f"チーム別ランキングが見つかりません (URL: {url})")
+
+    # ペイロードはエスケープ済みJSON。順位表に載らない選手も、正常取得時は0と判定する。
+    pattern = re.compile(
+        r'\\"href\\":\\"/player/(\d+)/\\".*?'
+        r'\\"points\\":([0-9]+(?:\.[0-9]+)?)',
+        re.DOTALL,
+    )
+    values = {}
+    for match in pattern.finditer(html):
+        value = _parse_stat_number(match.group(2))
+        if value is not None:
+            values[match.group(1)] = value
+    return values, url
 
 
 PLAYER_HISTORY_STAT_KEYS = {
@@ -531,6 +569,77 @@ PLAYER_HISTORY_STAT_KEYS = {
     "yellow_count": "警告数",
     "red_count": "退場数",
 }
+GK_ONLY_STAT_KEYS = {
+    "lost", "suffer_shoot", "suffer_shoot_on_target", "save_count", "save_rate",
+    "save_count_per_game", "save_rate_in_pa", "save_rate_out_pa",
+    "save_catch_rate_in_pa", "save_catch_rate_out_pa", "cross_catch_rate",
+    "save_punch_rate_in_pa", "save_punch_rate_out_pa", "cross_punch_rate", "clean_sheet",
+}
+COMMON_PLAYER_STAT_KEYS = {
+    "game", "time", "score", "shoot", "yellow_count", "red_count",
+    "foul_count", "suffer_foul_count", "pass_count", "pass_rate", "pass_count_per_game",
+    "long_pass_count", "long_pass_rate", "long_pass_count_per_game",
+}
+
+
+def _parse_stat_number(value):
+    """詳細スタッツの表示値（単位・%付き）を数値にする。"""
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    if not match:
+        return None
+    number = float(match.group(0))
+    return int(number) if number.is_integer() else number
+
+
+def _parse_player_detailed_stats(html, season):
+    """個人ページのシーズン別詳細スタッツを既存の統計コードへ対応づける。"""
+    game_kind_id = SEASON_GAME_KIND_IDS[season]
+    all_stats_start = html.find(r'\"allYearsDetailedStats\":{')
+    if all_stats_start < 0:
+        raise RuntimeError("選手の詳細スタッツが見つかりません")
+
+    season_key = f'{season[:4]}-{game_kind_id}'
+    season_marker = rf'\"{season_key}\":{{'
+    season_start = html.find(season_marker, all_stats_start)
+    if season_start < 0:
+        raise RuntimeError(f"対象シーズンの詳細スタッツが見つかりません: {season_key}")
+    season_start += len(season_marker)
+    next_season = re.search(r'},\"\d{4}-\d+\":{', html[season_start:])
+    season_data = html[season_start:season_start + next_season.start()] if next_season else html[season_start:]
+
+    token_to_stat = {
+        "shoot": "shoot", "saveCount": "save_count", "passCount": "pass_count",
+        "longPassCount": "long_pass_count", "throughPassCount": "through_pass_count",
+        "crossCount": "cross_count", "tackleCount": "tackle_count",
+        "dribbleCount": "dribble_count", "airBattleWinCount": "air_battle_win_count",
+    }
+    subvalue_to_stat = {
+        "shoot": "shoot_on_target", "saveCount": "save_rate", "passCount": "pass_rate",
+        "longPassCount": "long_pass_rate", "throughPassCount": "through_pass_rate",
+        "crossCount": "cross_rate", "tackleCount": "tackle_rate",
+        "dribbleCount": "dribble_rate", "airBattleWinCount": "air_battle_win_rate",
+    }
+    stats = {key: None for key in STAT_NAME_MAP}
+    for item in re.finditer(
+        r'\\"id\\":\\"section-[^"\\]*?-item-\d+-([A-Za-z]\w*)\\",'
+        r'\\"title\\":\\"[^"\\]*\\",\\"value\\":\\"([^"\\]*)\\"'
+        r'(?:,\\"subValue\\":\\"([^"\\]*)\\")?',
+        season_data,
+    ):
+        token, value, subvalue = item.groups()
+        stat = token_to_stat.get(token)
+        if stat is None:
+            snake = re.sub(r"([A-Z])", r"_\1", token).lower()
+            snake = snake.replace("_pg", "_per_game")
+            stat = snake if snake in STAT_NAME_MAP else None
+        if stat:
+            stats[stat] = _parse_stat_number(value)
+        sub_stat = subvalue_to_stat.get(token)
+        if sub_stat and subvalue is not None:
+            stats[sub_stat] = _parse_stat_number(subvalue)
+    if not any(value is not None for value in stats.values()):
+        raise RuntimeError(f"対象シーズンの詳細スタッツを解析できません: {season_key}")
+    return stats
 
 
 def _fetch_player_history_stats(player_id, season):
@@ -574,17 +683,61 @@ def _fetch_player_history_stats(player_id, season):
         if cards:
             stats["yellow_count"] += int(cards.group(1))
             stats["red_count"] += int(cards.group(2))
-    return stats
+    try:
+        detailed_stats = _parse_player_detailed_stats(html, season)
+    except RuntimeError:
+        if stats["game"] != 0:
+            raise
+        # 出場がない選手はシーズン詳細欄自体がない場合がある。これは取得失敗ではなく、
+        # 位置に応じて該当項目を0、対象外項目を空欄として扱う。
+        position = re.search(r'\\"positionText\\":\\"stats_info\.(gk|df|mf|fw)\\"', html)
+        is_goalkeeper = bool(position and position.group(1) == "gk")
+        detailed_stats = {key: None for key in STAT_NAME_MAP}
+        for key in COMMON_PLAYER_STAT_KEYS:
+            detailed_stats[key] = 0
+        if is_goalkeeper:
+            for key in GK_ONLY_STAT_KEYS:
+                detailed_stats[key] = 0
+        else:
+            for key in STAT_NAME_MAP:
+                if key not in GK_ONLY_STAT_KEYS:
+                    detailed_stats[key] = 0
+    detailed_stats["game"] = stats["game"]
+    # 個人ページの詳細スタッツがある値を優先し、試合履歴由来の基本値を補完する。
+    for key in ("time", "score", "shoot", "yellow_count", "red_count"):
+        if detailed_stats[key] is None:
+            detailed_stats[key] = stats[key]
+    return detailed_stats
 
 
-def collect_appearances(year, category, team, output_dir="output"):
-    """公式サイトの選手履歴から、チームの選手別基本スタッツを集計する。"""
+def collect_appearances(year, category, team, output_dir="output", selected_stats=None):
+    """公式個人ページとチーム別ランキングから選手スタッツを集計する。"""
     if year not in SEASON_GAME_KIND_IDS:
         raise ValueError("出場試合数の集計は 2026 または 2026-27 に対応しています")
 
     players = _fetch_player_roster(year, category, team)
     fallbacks = _load_stat_fallbacks()
     print(f"選手一覧を取得しました: {len(players)}人")
+    # チームで絞った公式ランキングを使うことで、移籍前後を分けたチーム在籍時の値を取る。
+    # ポジションに存在する項目だけ取得し、同じチームの選手間ではランキングを共有する。
+    selected_stats = set(selected_stats or STAT_NAME_MAP)
+    applicable_stats = {
+        stat for stat in STAT_NAME_MAP
+        if stat in selected_stats
+        if any(_is_stat_applicable(stat, p.get("position", "")) for p in players)
+        and (category == "j1" or stat not in J1_ONLY_PHYSICAL_STAT_KEYS)
+    }
+    team_rankings = {}
+    ranking_errors = {}
+    for stat in STAT_NAME_MAP:
+        if stat not in applicable_stats:
+            continue
+        try:
+            team_rankings[stat] = _fetch_team_stat_ranking(year, category, team, stat)
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            ranking_errors[stat] = str(e)
+            print(f"注意: {team} の {STAT_NAME_MAP[stat]}を取得できません: {e}")
+
     rows = []
     errors = []
     for index, player in enumerate(players, start=1):
@@ -594,43 +747,95 @@ def collect_appearances(year, category, team, output_dir="output"):
             player_stats = _fetch_player_history_stats(player["player_id"], year)
             source_type = "選手個人ページ"
             source_url = player_url
+            fetch_error = None
         except (requests.exceptions.RequestException, RuntimeError) as e:
-            fallback_key = (year, category, team, player["player_id"], "game")
-            fallback = fallbacks.get(fallback_key)
-            errors.append((player["player_id"], player["player_name"], str(e)))
-            if fallback is None:
-                player_stats = {key: 0 for key in PLAYER_HISTORY_STAT_KEYS}
-                source_type = "未取得"
-                source_url = ""
-            else:
-                player_stats["game"] = fallback["value"]
+            player_stats = {
+                key: (0 if _is_stat_applicable(key, player.get("position", "")) else None)
+                for key in STAT_NAME_MAP
+            }
+            source_type = "未取得"
+            source_url = ""
+            fetch_error = str(e)
+
+        player_fallbacks = {
+            key[4]: value for key, value in fallbacks.items()
+            if key[:4] == (year, category, team, player["player_id"])
+        }
+        # 成功した公式チーム別ランキングは、個人ページのシーズン合計より優先する。
+        # ランキングに選手がいない場合は、順位外として0を記録する。
+        for stat, (ranking, ranking_url) in team_rankings.items():
+            if _is_stat_applicable(stat, player.get("position", "")):
+                player_stats[stat] = ranking.get(player["player_id"], 0)
+                if stat == "game":
+                    source_type = "公式チーム別スタッツ"
+                    source_url = ranking_url
+        for stat, fallback in player_fallbacks.items():
+            if stat not in STAT_NAME_MAP:
+                continue
+            if fallback["source_type"] == "公式チーム別スタッツ" or source_type == "未取得" or player_stats.get(stat) is None:
+                player_stats[stat] = fallback["value"]
+            if stat == "game" and (source_type == "未取得" or fallback["source_type"] == "公式チーム別スタッツ"):
                 source_type = fallback["source_type"]
                 source_url = fallback["source_url"]
+
+        if fetch_error:
+            required_stats = {
+                stat for stat in STAT_NAME_MAP
+                if stat in selected_stats
+                if _is_stat_applicable(stat, player.get("position", ""))
+                and (category == "j1" or stat not in J1_ONLY_PHYSICAL_STAT_KEYS)
+            }
+            available_stats = set(team_rankings) | set(player_fallbacks)
+            if not required_stats.issubset(available_stats):
+                errors.append((player["player_id"], player["player_name"], fetch_error))
+        if ranking_errors:
+            for stat, error in ranking_errors.items():
+                if stat in selected_stats and _is_stat_applicable(stat, player.get("position", "")):
+                    errors.append((
+                        player["player_id"], player["player_name"],
+                        f"{STAT_NAME_MAP[stat]}のチーム別ランキング取得失敗: {error}",
+                    ))
         row = {
             "player_url": player_url,
             "player_name": player["player_name"],
-            "team_name": "清水エスパルス" if team == "shimizu" else team,
+            "team_name": {
+                "shimizu": "清水エスパルス",
+                "yokohamafc": "横浜FC",
+            }.get(team, team),
             "source_type": source_type,
             "source_url": source_url,
+            "_position": player.get("position", ""),
         }
-        row.update(player_stats)
+        row.update({key: value for key, value in player_stats.items() if key in selected_stats})
+        if category in ("j2", "j3"):
+            for stat in J1_ONLY_PHYSICAL_STAT_KEYS:
+                row[stat] = None
         rows.append(row)
 
     if errors:
-        print(f"注意: {len(errors)}人は履歴を確認できず、取得失敗スタッツは0にします:")
+        print(f"注意: {len(errors)}件のスタッツ取得失敗があります:")
         for player_id, name, error in errors:
             print(f"  {name} ({player_id}): {error}")
         error_rows = []
         for player_id, name, error in errors:
             player_url = f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats"
-            for stat_key, stat_label in PLAYER_HISTORY_STAT_KEYS.items():
-                if stat_key == "game" and (year, category, team, player_id, "game") in fallbacks:
-                    continue
-                error_rows.append((team, name, player_url, stat_label, error))
+            error_rows.append((team, name, player_url, "選手ページ/チーム別ランキング", error))
         _write_stat_failure_log(output_dir, year, category, team, error_rows)
         if error_rows:
             print(f"取得失敗ログ: {os.path.join(output_dir, f'stats_{team}_{year}_{category}_errors.csv')}")
+    else:
+        # 前回実行の失敗ログが残らないよう、既存ファイルがあれば空に更新する。
+        _write_stat_failure_log(output_dir, year, category, team, [])
     return rows
+
+
+def _is_stat_applicable(stat, position):
+    """ポジション別スタッツの対象かを判定する。未知のポジションは対象扱い。"""
+    if position == "GK":
+        return stat in GK_ONLY_STAT_KEYS or stat in COMMON_PLAYER_STAT_KEYS
+    if position in ("DF", "MF", "FW"):
+        return stat not in GK_ONLY_STAT_KEYS
+    return True
 
 def _normalize_player_url(df):
     if "player_url" in df.columns:
@@ -735,17 +940,17 @@ def _merge_stat_by_key(final_df, df_stat, stat_col):
 
 def _write_stat_failure_log(output_dir, year, category, team, failures):
     """取得に失敗したスタッツを、通常のCSVとは別のログCSVに記録する。"""
-    if not failures:
-        return
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, f"stats_{team}_{year}_{category}_errors.csv")
+    if not failures and not os.path.exists(filepath):
+        return
     with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(["チーム", "選手名", "選手URL", "項目", "理由"])
         writer.writerows(failures)
 
 def collect_team_stats(year, category, team, output_dir="output", strict=False):
-    stat_types = list(STAT_NAME_MAP.keys())
+    stat_types = _stat_keys_for_category(category)
     print(f"--- Target: {year} {category} {team} ---")
 
     # --- Step 1: 選手マスタ（ベース）の作成 ---
@@ -863,34 +1068,27 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
 
 def main():
     parser = argparse.ArgumentParser(description="J.League Player Stats Collector")
-    parser.add_argument("--year", default="2025", help="取得したいシーズン（例: 2025 / 2026-27）")
+    parser.add_argument("--season", dest="year", default="2026-27", help="取得したいシーズン（例: 2025 / 2026-27）")
     parser.add_argument("--category", default="j1", choices=["j1", "j2", "j3"], help="カテゴリ（j1 / j2 / j3）")
     parser.add_argument("--team", default="shimizu", help="チームスラッグ（例: shimizu / kashima / all）")
     parser.add_argument("--output", default="output", help="保存先フォルダ（例: output）")
     parser.add_argument("--interactive", action="store_true", help="対話式ウィザードで実行する")
     parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
-    parser.add_argument("--strict", action="store_true", help="厳格モード（ランキングが見つからない場合は例外で中断）")
     parser.add_argument(
-        "--appearances-only", "--player-history-stats",
-        action="store_true",
-        help="選手個人ページから取得できる基本スタッツを集計する（2026 / 2026-27、J1）",
+        "--stats", default="all",
+        help="取得するスタッツ項目（カンマ区切り。デフォルト: 全項目）",
     )
     
     args = parser.parse_args()
 
-    # CLI引数の --year も正規化する（全角数字→半角変換 + 妥当性検証）
+    # CLI引数の --season も正規化する（全角数字→半角変換 + 妥当性検証）
     args.year = _normalize_year(args.year)
-    if args.appearances_only:
-        if args.year not in SEASON_GAME_KIND_IDS:
-            parser.error("--appearances-only は --year 2026 または 2026-27 を指定してください")
-        if args.category != "j1":
-            parser.error("--appearances-only は現在J1に対応しています")
-        if args.team == "all":
-            parser.error("--appearances-only は現在チームを1つ指定してください")
-    elif not _is_valid_year(args.year):
-        parser.error(f"--year は4桁の半角数字で指定してください（入力値: {args.year!r}）")
-    elif BeautifulSoup is None or pd is None:
-        parser.error("通常の全スタッツ取得には依存パッケージが必要です。pip install -r requirements.txt を実行してください")
+    selected_stats = list(STAT_NAME_MAP) if args.stats.strip().lower() == "all" else [s.strip() for s in args.stats.split(",") if s.strip()]
+    unknown_stats = sorted(set(selected_stats) - set(STAT_NAME_MAP))
+    if not selected_stats or unknown_stats:
+        parser.error("--stats は all またはスタッツ項目名のカンマ区切りで指定してください。未知の項目: " + ", ".join(unknown_stats))
+    if not (_is_valid_year(args.year) or args.year in SEASON_GAME_KIND_IDS):
+        parser.error(f"--season は4桁の半角数字または 2026-27 で指定してください（入力値: {args.year!r}）")
 
     # 引数なし、または対話式指定ならウィザードを起動
     if args.interactive or len(sys.argv) == 1:
@@ -909,112 +1107,53 @@ def main():
             print("チーム一覧の取得に失敗しました。")
         return
 
-    if args.appearances_only:
-        final_df = collect_appearances(args.year, args.category, args.team, args.output)
-        os.makedirs(args.output, exist_ok=True)
-        filename = f"stats_{args.team}_{args.year}_{args.category}.csv"
-        filepath = os.path.join(args.output, filename)
-        columns = [
-            ("player_url", "選手URL"),
-            ("player_name", "選手名"),
-            ("team_name", "チーム名"),
-            *((stat, STAT_NAME_MAP[stat]) for stat in ("game", "time", "score", "shoot", "yellow_count", "red_count")),
-            ("source_type", "出場試合数の取得方法"),
-            ("source_url", "出場試合数の出典URL"),
-        ]
-        with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow([label for _, label in columns])
-            writer.writerows([[row[key] for key, _ in columns] for row in final_df])
-        print(f"\nSUCCESS: Saved to {filepath}")
-        print(f"Total players: {len(final_df)}")
-        return
-    
+    if args.year not in SEASON_GAME_KIND_IDS:
+        parser.error("選手一覧起点のスタッツ取得は --season 2026 または 2026-27 に対応しています")
+    if BeautifulSoup is None or pd is None:
+        parser.error("スタッツ取得には依存パッケージが必要です。pip install -r requirements.txt を実行してください")
+
     if args.team == "all":
-        print("all は全チーム取得のため、10〜15分程度かかる場合があります。")
+        teams = get_team_list(args.year, args.category)
+        if not teams:
+            print("チーム一覧の取得に失敗したため、処理を中止します。")
+            return
+        print(f"{len(teams)} チームを取得します。時間がかかる場合があります。")
         if not prompt_yes_no("実行しますか？", default="n"):
             print("キャンセルしました。")
             return
-        teams = get_team_list(args.year, args.category)
-        if not teams:
-            print("チーム一覧が取得できなかったため、処理を中止します。")
-            return
-        print(f"Found {len(teams)} teams for {args.year} {args.category}: {', '.join(teams)}")
-
-        all_teams_df = []
-        failed_teams = []
-        for i, t in enumerate(teams):
-            print(f"\n[Team {i+1}/{len(teams)}] Processing {t}...")
-            # 1チームの失敗で全体が止まると、それまでに取得したデータが
-            # すべて破棄されてしまうため、チーム単位でエラーを隔離する
-            try:
-                team_df = collect_team_stats(
-                    args.year, args.category, t, args.output, strict=args.strict
-                )
-            except Exception as e:
-                print(f"  [チーム失敗] {t}: {e}")
-                failed_teams.append(t)
-                continue
-
-            if team_df is not None and not team_df.empty:
-                all_teams_df.append(team_df)
-
-        if failed_teams:
-            print(
-                f"\n警告: {len(failed_teams)}/{len(teams)} チームで失敗しました: "
-                + ", ".join(failed_teams)
-            )
-
-        if not all_teams_df:
-            print("No data collected for any team.")
-            return
-
-        final_df = pd.concat(all_teams_df, ignore_index=True)
-        # 最後に全体で重複排除（念のため）
-        final_df = _dedupe_players(final_df)
     else:
-        final_df = collect_team_stats(args.year, args.category, args.team, args.output, strict=args.strict)
+        teams = [args.team]
 
-    if final_df is None or final_df.empty:
+    all_rows = []
+    for current_team in teams:
+        try:
+            all_rows.extend(collect_appearances(
+                args.year, args.category, current_team, args.output, selected_stats
+            ))
+        except Exception as error:
+            print(f"  [チーム失敗] {current_team}: {error}")
+    if not all_rows:
         print("No data collected.")
         return
-
-    # 数値列は数値型に統一する。
-    # 旧実装は DataFrame 全体を fillna("0") していたため、player_url の欠損が
-    # 文字列 "0" になって出力されていた。ここでは統計列だけを処理する。
-    for st in STAT_NAME_MAP.keys():
-        if st in final_df.columns:
-            final_df[st] = pd.to_numeric(final_df[st], errors="coerce").fillna(0)
-
-    # 文字列列の欠損は空文字にする（URLに "0" が入るのを防ぐ）
-    for col in ("player_url", "player_name", "team_name"):
-        if col in final_df.columns:
-            final_df[col] = final_df[col].fillna("").astype(str)
-
-    rename_map = {
-        "player_url": "選手URL",
-        "player_name": "選手名",
-        "team_name": "チーム名"
-    }
-    
-    original_cols = final_df.columns.tolist()
-    
-    for st, label in STAT_NAME_MAP.items():
-        if st in original_cols:
-            rename_map[st] = label
-    
-    ordered_cols = ["player_url", "player_name", "team_name"] + [st for st in STAT_NAME_MAP.keys() if st in original_cols]
-    final_df = final_df[ordered_cols]
-    final_df = final_df.rename(columns=rename_map)
-
-    if not os.path.exists(args.output):
-        os.makedirs(args.output)
-        
+    final_df = all_rows
+    os.makedirs(args.output, exist_ok=True)
     filename = f"stats_{args.team}_{args.year}_{args.category}.csv"
     filepath = os.path.join(args.output, filename)
-    final_df.to_csv(filepath, index=False, encoding="utf-8-sig")
+    columns = [
+        ("player_url", "選手URL"),
+        ("player_name", "選手名"),
+        ("team_name", "チーム名"),
+        *((stat, STAT_NAME_MAP[stat]) for stat in selected_stats),
+        ("source_type", "出場試合数の取得方法"),
+        ("source_url", "出場試合数の出典URL"),
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([label for _, label in columns])
+        writer.writerows([[row.get(key) for key, _ in columns] for row in final_df])
     print(f"\nSUCCESS: Saved to {filepath}")
     print(f"Total players: {len(final_df)}")
+    return
 
 if __name__ == "__main__":
     main()
