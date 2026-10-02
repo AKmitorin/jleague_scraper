@@ -1076,6 +1076,7 @@ def main():
     parser.add_argument("--output", default="output", help="保存先フォルダ（例: output）")
     parser.add_argument("--interactive", action="store_true", help="対話式ウィザードで実行する")
     parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
+    parser.add_argument("--list-stats", action="store_true", help="指定カテゴリで取得可能なスタッツ項目を表示して終了する")
     parser.add_argument(
         "--stats", default="all",
         help="取得するスタッツ項目（カンマ区切り。デフォルト: 全項目）",
@@ -1100,6 +1101,13 @@ def main():
         args.team = team
         args.output = output
 
+    if args.category in ("j2", "j3") and args.stats.strip().lower() != "all":
+        unavailable_stats = sorted(set(selected_stats) & J1_ONLY_PHYSICAL_STAT_KEYS)
+        if unavailable_stats:
+            parser.error(
+                f"J2/J3では取得できない項目が指定されています: {', '.join(unavailable_stats)}"
+            )
+
     if args.list_teams:
         teams = get_team_list(args.year, args.category)
         if teams:
@@ -1107,6 +1115,12 @@ def main():
             print(", ".join(teams))
         else:
             print("チーム一覧の取得に失敗しました。")
+        return
+
+    if args.list_stats:
+        print(f"取得可能なスタッツ項目（{args.category}）:")
+        for stat in _stat_keys_for_category(args.category):
+            print(f"  {stat}\t{STAT_NAME_MAP[stat]}")
         return
 
     if args.year not in SEASON_GAME_KIND_IDS:
