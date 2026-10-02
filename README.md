@@ -55,6 +55,17 @@ pip install -r requirements.txt
 
 ## 使い方
 
+### 出場試合数を集計（2026シーズン）
+
+現行Jリーグ公式サイトでは、選手個人ページの出場履歴からランキング外の選手も含めて出場試合数を集計できます。現在対応しているのはJ1のチーム指定で、次のように実行します。
+
+```shell
+py main.py --year 2026 --category j1 --team shimizu --appearances-only
+py main.py --year 2026-27 --category j1 --team shimizu --appearances-only
+```
+
+CSVには対象チームの選手一覧と選手ごとの出場試合数を出力します。選手ページに履歴のない一部選手は出場数が空欄になります。現在確認できている2026特別シーズンの3選手分は公式発表の数字で補完します。
+
 ### 対話式ウィザード（初心者向け）
 
 ```shell

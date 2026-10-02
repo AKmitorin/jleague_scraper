@@ -1,6 +1,13 @@
 import requests
-from bs4 import BeautifulSoup
-import pandas as pd
+import csv
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
 import time
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -291,7 +298,7 @@ def _parse_retry_after(headers):
         return None
 
 
-def _request_with_retry(url, context="", max_retries=MAX_RETRIES):
+def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUEST_TIMEOUT):
     """GETリクエストをリトライ付きで実行する。成功時はレスポンスを返す。
 
     リトライ対象:
@@ -309,7 +316,7 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES):
     for attempt in range(1, max_retries + 1):
         exhausted = attempt >= max_retries
         try:
-            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            response = session.get(url, timeout=timeout)
 
             # 429 Too Many Requests
             if response.status_code == 429:
@@ -444,6 +451,120 @@ def fetch_stat(stat_type, year, category, team, strict=False):
                     r["team_name"] = most_common_team
     
     return pd.DataFrame(rows)
+
+
+SEASON_GAME_KIND_IDS = {
+    "2026": 249,     # 2026特別シーズン
+    "2026-27": 2,    # 2026/27シーズン
+}
+
+# 2026特別シーズンは一部選手の個人ページに履歴が掲載されないため、
+# Jリーグ公式発表で確認できる出場数を補完する。
+APPEARANCE_FALLBACKS = {
+    "2026": {
+        "1636270": 17,  # 宇野禅斗
+        "1650727": 3,   # アフメド アフメドフ
+        "1652850": 5,   # アルフレド ステファンス
+    },
+}
+
+
+def _fetch_player_roster(year, category, team):
+    """選手スタッツページの選手フィルターから選手IDと名前を取得する。"""
+    url = (
+        f"https://www.jleague.jp/{category}/stats/player/"
+        f"{year}/game/search-list/?club={team}"
+    )
+    time.sleep(REQUEST_INTERVAL)
+    response = _request_with_retry(url, context=f"{team}の選手一覧")
+    html = response.text
+
+    # Next.js のサーバーペイロード内に、選手フィルターの全候補が含まれる。
+    start = html.find(r'\"id\":\"player-club-')
+    if start < 0:
+        raise RuntimeError(f"選手一覧のデータが見つかりません (URL: {url})")
+    end = html.find(r'\"id\":\"ranking-', start)
+    if end < 0:
+        end = min(len(html), start + 200_000)
+    block = html[start:end]
+
+    players = []
+    seen = set()
+    for player_id, name in re.findall(
+        r'\\"value\\":\\"(\d+)\\",\\"label\\":\\"([^"\\]+)\\"', block
+    ):
+        if player_id not in seen:
+            players.append({"player_id": player_id, "player_name": name})
+            seen.add(player_id)
+    if not players:
+        raise RuntimeError(f"選手一覧を解析できません (URL: {url})")
+    return players
+
+
+def _fetch_player_appearances(player_id, season):
+    """個人ページの全シーズン履歴から指定シーズンの出場試合数を数える。"""
+    game_kind_id = SEASON_GAME_KIND_IDS[season]
+    url = f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats"
+    time.sleep(REQUEST_INTERVAL)
+    response = _request_with_retry(
+        url, context=f"選手ID {player_id} の出場履歴", timeout=(5, 45)
+    )
+    html = response.text
+
+    history_match = re.search(
+        r'\\"playerHistory\\":\[(.*?)\],\\"playerCareer\\"',
+        html,
+        re.DOTALL,
+    )
+    if not history_match:
+        raise RuntimeError(f"選手履歴が見つかりません (URL: {url})")
+
+    history = history_match.group(1)
+    entries = list(re.finditer(
+        r'\\"id\\":\\"history-[^"\\]+\\",\\"date\\":\\"[^"\\]*\\",'
+        r'\\"year\\":(\d+),\\"gameKindId\\":(\d+)',
+        history,
+    ))
+    appearances = 0
+    for index, entry in enumerate(entries):
+        record_end = entries[index + 1].start() if index + 1 < len(entries) else len(history)
+        record = history[entry.start():record_end]
+        if int(entry.group(1)) != 2026 or int(entry.group(2)) != game_kind_id:
+            continue
+        if re.search(r'\\"appearance\\":\\"(?:start|sub)\\"', record):
+            appearances += 1
+    return appearances
+
+
+def collect_appearances(year, category, team):
+    """公式サイトの選手履歴から、チームの選手別出場試合数を集計する。"""
+    if year not in SEASON_GAME_KIND_IDS:
+        raise ValueError("出場試合数の集計は 2026 または 2026-27 に対応しています")
+
+    players = _fetch_player_roster(year, category, team)
+    print(f"選手一覧を取得しました: {len(players)}人")
+    rows = []
+    errors = []
+    for index, player in enumerate(players, start=1):
+        print(f"[{index}/{len(players)}] {player['player_name']} の出場履歴を取得中")
+        try:
+            appearances = _fetch_player_appearances(player["player_id"], year)
+        except (requests.exceptions.RequestException, RuntimeError) as e:
+            appearances = APPEARANCE_FALLBACKS.get(year, {}).get(player["player_id"])
+            if appearances is None:
+                errors.append((player["player_id"], player["player_name"], str(e)))
+        rows.append({
+            "player_url": f"https://www.jleague.jp/player/{player['player_id']}/?navicode=j1#stats",
+            "player_name": player["player_name"],
+            "team_name": "清水エスパルス" if team == "shimizu" else team,
+            "game": appearances,
+        })
+
+    if errors:
+        print(f"注意: {len(errors)}人は履歴を確認できず、出場数を空欄にします:")
+        for player_id, name, error in errors:
+            print(f"  {name} ({player_id}): {error}")
+    return rows
 
 def _normalize_player_url(df):
     if "player_url" in df.columns:
@@ -651,22 +772,34 @@ def collect_team_stats(year, category, team, output_dir="output", strict=False):
 
 def main():
     parser = argparse.ArgumentParser(description="J.League Player Stats Collector")
-    parser.add_argument("--year", default="2025", help="取得したいシーズン（例: 2025）")
+    parser.add_argument("--year", default="2025", help="取得したいシーズン（例: 2025 / 2026-27）")
     parser.add_argument("--category", default="j1", choices=["j1", "j2", "j3"], help="カテゴリ（j1 / j2 / j3）")
     parser.add_argument("--team", default="shimizu", help="チームスラッグ（例: shimizu / kashima / all）")
     parser.add_argument("--output", default="output", help="保存先フォルダ（例: output）")
     parser.add_argument("--interactive", action="store_true", help="対話式ウィザードで実行する")
     parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
     parser.add_argument("--strict", action="store_true", help="厳格モード（ランキングが見つからない場合は例外で中断）")
+    parser.add_argument(
+        "--appearances-only",
+        action="store_true",
+        help="選手個人ページから出場試合数のみ集計する（2026 / 2026-27、J1）",
+    )
     
     args = parser.parse_args()
 
     # CLI引数の --year も正規化する（全角数字→半角変換 + 妥当性検証）
     args.year = _normalize_year(args.year)
-    if not _is_valid_year(args.year):
-        parser.error(
-            f"--year は4桁の半角数字で指定してください（入力値: {args.year!r}）"
-        )
+    if args.appearances_only:
+        if args.year not in SEASON_GAME_KIND_IDS:
+            parser.error("--appearances-only は --year 2026 または 2026-27 を指定してください")
+        if args.category != "j1":
+            parser.error("--appearances-only は現在J1に対応しています")
+        if args.team == "all":
+            parser.error("--appearances-only は現在チームを1つ指定してください")
+    elif not _is_valid_year(args.year):
+        parser.error(f"--year は4桁の半角数字で指定してください（入力値: {args.year!r}）")
+    elif BeautifulSoup is None or pd is None:
+        parser.error("通常の全スタッツ取得には依存パッケージが必要です。pip install -r requirements.txt を実行してください")
 
     # 引数なし、または対話式指定ならウィザードを起動
     if args.interactive or len(sys.argv) == 1:
@@ -683,6 +816,25 @@ def main():
             print(", ".join(teams))
         else:
             print("チーム一覧の取得に失敗しました。")
+        return
+
+    if args.appearances_only:
+        final_df = collect_appearances(args.year, args.category, args.team)
+        os.makedirs(args.output, exist_ok=True)
+        filename = f"stats_{args.team}_{args.year}_{args.category}.csv"
+        filepath = os.path.join(args.output, filename)
+        columns = [
+            ("player_url", "選手URL"),
+            ("player_name", "選手名"),
+            ("team_name", "チーム名"),
+            ("game", STAT_NAME_MAP["game"]),
+        ]
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([label for _, label in columns])
+            writer.writerows([[row[key] for key, _ in columns] for row in final_df])
+        print(f"\nSUCCESS: Saved to {filepath}")
+        print(f"Total players: {len(final_df)}")
         return
     
     if args.team == "all":
