@@ -15,6 +15,7 @@ import re
 import argparse
 import os
 import sys
+from pathlib import Path
 
 # HTTP request timeout (connect, read) in seconds
 REQUEST_TIMEOUT = (5, 20)
@@ -458,15 +459,36 @@ SEASON_GAME_KIND_IDS = {
     "2026-27": 2,    # 2026/27シーズン
 }
 
-# 2026特別シーズンは一部選手の個人ページに履歴が掲載されないため、
-# Jリーグ公式発表で確認できる出場数を補完する。
-APPEARANCE_FALLBACKS = {
-    "2026": {
-        "1636270": 17,  # 宇野禅斗
-        "1650727": 3,   # アフメド アフメドフ
-        "1652850": 5,   # アルフレド ステファンス
-    },
-}
+FALLBACKS_FILE = Path(__file__).resolve().parent / "data" / "stat_fallbacks.csv"
+
+
+def _load_stat_fallbacks():
+    """外部CSVの補完値を (season, category, team, player_id, stat) で索引化する。"""
+    fallbacks = {}
+    if not FALLBACKS_FILE.exists():
+        return fallbacks
+
+    with FALLBACKS_FILE.open(newline="", encoding="utf-8-sig") as csv_file:
+        for row_number, row in enumerate(csv.DictReader(csv_file), start=2):
+            key = tuple(row[field].strip() for field in (
+                "season", "category", "team", "player_id", "stat"
+            ))
+            if not all(key):
+                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: 必須項目が空です")
+            if key in fallbacks:
+                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: 補完キーが重複しています: {key}")
+            try:
+                value = float(row["value"])
+                if value.is_integer():
+                    value = int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: value が数値ではありません")
+            fallbacks[key] = {
+                "value": value,
+                "source_type": row["source_type"].strip(),
+                "source_url": row["source_url"].strip(),
+            }
+    return fallbacks
 
 
 def _fetch_player_roster(year, category, team):
@@ -542,22 +564,36 @@ def collect_appearances(year, category, team):
         raise ValueError("出場試合数の集計は 2026 または 2026-27 に対応しています")
 
     players = _fetch_player_roster(year, category, team)
+    fallbacks = _load_stat_fallbacks()
     print(f"選手一覧を取得しました: {len(players)}人")
     rows = []
     errors = []
     for index, player in enumerate(players, start=1):
         print(f"[{index}/{len(players)}] {player['player_name']} の出場履歴を取得中")
+        player_url = f"https://www.jleague.jp/player/{player['player_id']}/?navicode=j1#stats"
         try:
             appearances = _fetch_player_appearances(player["player_id"], year)
+            source_type = "選手個人ページ"
+            source_url = player_url
         except (requests.exceptions.RequestException, RuntimeError) as e:
-            appearances = APPEARANCE_FALLBACKS.get(year, {}).get(player["player_id"])
-            if appearances is None:
+            fallback_key = (year, category, team, player["player_id"], "game")
+            fallback = fallbacks.get(fallback_key)
+            if fallback is None:
                 errors.append((player["player_id"], player["player_name"], str(e)))
+                appearances = None
+                source_type = "未取得"
+                source_url = ""
+            else:
+                appearances = fallback["value"]
+                source_type = fallback["source_type"]
+                source_url = fallback["source_url"]
         rows.append({
-            "player_url": f"https://www.jleague.jp/player/{player['player_id']}/?navicode=j1#stats",
+            "player_url": player_url,
             "player_name": player["player_name"],
             "team_name": "清水エスパルス" if team == "shimizu" else team,
             "game": appearances,
+            "source_type": source_type,
+            "source_url": source_url,
         })
 
     if errors:
@@ -828,6 +864,8 @@ def main():
             ("player_name", "選手名"),
             ("team_name", "チーム名"),
             ("game", STAT_NAME_MAP["game"]),
+            ("source_type", "取得方法"),
+            ("source_url", "出典URL"),
         ]
         with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
             writer = csv.writer(csv_file)
