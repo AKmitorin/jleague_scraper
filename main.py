@@ -1,14 +1,6 @@
 import requests
 import csv
 import json
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
 import time
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
@@ -384,77 +376,6 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
     raise requests.exceptions.RequestException(
         f"{context} リクエストが{max_retries}回の試行後も成功しませんでした（最後の原因: {last_error}）"
     )
-
-
-def fetch_stat(stat_type, year, category, team, strict=False):
-    url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{stat_type}/"
-
-    # サーバー負荷軽減のため、固定待機を入れる
-    time.sleep(REQUEST_INTERVAL)
-
-    context = f"{team}の{stat_type}"
-    response = _request_with_retry(url, context=context)
-    html = response.text
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-    
-    ranking_list = soup.find("ul", class_="ranking_list")
-    if not ranking_list:
-        msg = f"{team}の{stat_type}ランキング取得失敗 (URL: {url})"
-
-        if strict:
-            raise RuntimeError(msg)
-        else:
-            print("WARNING:", msg)
-            return None
-        
-    items = ranking_list.find_all("li")
-    
-    for li in items:
-        if "ranking_header" in li.get("class", []) or li.find("p", class_="rank_title"):
-            continue
-
-        name_tag = li.find("p", class_="name")
-        link_tag = li.find("a")
-        team_tag = li.find("p", class_="team")
-        value_tag = (
-            li.select_one("div[class^='ranking_stats_'] p")
-            or li.select_one("div.ranking_stats p")
-        )
-
-        if not (name_tag and value_tag):
-            continue
-
-        name = name_tag.text.strip()
-        # 名前が空、またはヘッダーの残骸をスキップ
-        if not name or name == "選手名":
-            continue
-
-        team_name = team_tag.text.strip() if team_tag else ""
-        raw_value = value_tag.text.strip()
-        clean_value = raw_value.replace(",", "")
-        value_match = re.search(r'(\d+\.?\d*)', clean_value)
-        value = value_match.group(1) if value_match else "0"
-        
-        player_url = "https://www.jleague.jp" + link_tag["href"] if link_tag else ""
-
-        rows.append({
-            "player_url": player_url,
-            "player_name": name,
-            "team_name": team_name,
-            stat_type: value
-        })
-    
-    # チーム名補完
-    if rows:
-        valid_team_names = [r["team_name"] for r in rows if r["team_name"]]
-        if valid_team_names:
-            most_common_team = max(set(valid_team_names), key=valid_team_names.count)
-            for r in rows:
-                if not r["team_name"]:
-                    r["team_name"] = most_common_team
-    
-    return pd.DataFrame(rows)
 
 
 SEASON_GAME_KIND_IDS = {
@@ -839,107 +760,6 @@ def _is_stat_applicable(stat, position):
         return stat not in GK_ONLY_STAT_KEYS
     return True
 
-def _normalize_player_url(df):
-    if "player_url" in df.columns:
-        df["player_url"] = df["player_url"].fillna("").astype(str)
-    return df
-
-
-def _dedupe_players(df):
-    """選手を一意化する。
-
-    優先順位:
-      1. player_url があるものを採用する
-      2. player_url がない場合は 名前 + チーム名 で一意化する
-
-    旧実装は「URLあり」と「URLなし」の行を別々に drop_duplicates してから
-    結合していたため、同一選手（例: game ページにはURLあり、score ページにはURLなし）
-    が2行残っていた。フェーズごとのURLの有無が食い違うことは実際に 일어나るため、
-    ここでは URL 優先でまとめたうえで、名前+チームが一致する行は同一選手として扱う。
-    """
-    if df.empty:
-        return df.reset_index(drop=True)
-
-    df = _normalize_player_url(df.copy())
-
-    # チーム名が欠損している場合は、結合キーが壊れないように空文字へ寄せる
-    if "team_name" in df.columns:
-        df["team_name"] = df["team_name"].fillna("").astype(str)
-    if "player_name" in df.columns:
-        df["player_name"] = df["player_name"].fillna("").astype(str)
-
-    # 1) URL が一意に決まる行を確定（同名選手でもURLが違えば別人とみなす）
-    with_url = df[df["player_url"] != ""].drop_duplicates(subset=["player_url"], keep="first")
-
-    # 2) URL がない行は、名前+チームで一意化する
-    without_url = df[df["player_url"] == ""]
-    if not without_url.empty:
-        without_url = without_url.drop_duplicates(subset=["player_name", "team_name"], keep="first")
-
-    if with_url.empty:
-        return without_url.reset_index(drop=True)
-    if without_url.empty:
-        return with_url.reset_index(drop=True)
-
-    # 3) 名前+チームが一致する「URLなし」行は、既存の「URLあり」行と同一選手とみなす
-    known_keys = set(zip(with_url["player_name"], with_url["team_name"]))
-    absorbed_mask = without_url.apply(
-        lambda r: (r["player_name"], r["team_name"]) in known_keys, axis=1
-    )
-    absorbed = without_url[absorbed_mask]
-    if not absorbed.empty:
-        print(
-            f"  注意: {len(absorbed)}件の.URLなし行が同一選手のURLあり行と重複したため、"
-            "URLあり行に統合しました。"
-        )
-
-    kept_without_url = without_url[~absorbed_mask]
-    merged = pd.concat([with_url, kept_without_url], ignore_index=True)
-    return merged.reset_index(drop=True)
-
-def _merge_stat_by_key(final_df, df_stat, stat_col):
-    """player_url優先で結合。URLなしは名前+チームで結合する。
-
-    該当する行が見つからない場合は 0 で埋める。元の行を取りこぼさない。
-    旧実装は空DataFrameに `df[col] = []` を代入しており、意味のない列を作っていた。
-    """
-    final_df = _normalize_player_url(final_df.copy())
-    df_stat = _normalize_player_url(df_stat.copy())
-
-    final_with_url = final_df[final_df["player_url"] != ""].copy()
-    final_without_url = final_df[final_df["player_url"] == ""].copy()
-
-    stat_with_url = (
-        df_stat[df_stat["player_url"] != ""][["player_url", stat_col]]
-        .drop_duplicates(subset=["player_url"])
-    )
-    stat_without_url = (
-        df_stat[df_stat["player_url"] == ""][["player_name", "team_name", stat_col]]
-        .drop_duplicates(subset=["player_name", "team_name"])
-    )
-
-    parts = []
-    if not final_with_url.empty:
-        merged_with = pd.merge(final_with_url, stat_with_url, on="player_url", how="left")
-        merged_with[stat_col] = merged_with[stat_col].fillna(0)
-        parts.append(merged_with)
-
-    if not final_without_url.empty:
-        merged_without = pd.merge(
-            final_without_url, stat_without_url, on=["player_name", "team_name"], how="left"
-        )
-        merged_without[stat_col] = merged_without[stat_col].fillna(0)
-        parts.append(merged_without)
-
-    if not parts:
-        # 元データが行がない場合は、列のみを持つ空DataFrameを返す
-        empty = final_df.copy()
-        empty[stat_col] = pd.Series(dtype="object")
-        return empty
-
-    return pd.concat(parts, ignore_index=True)
-
-
 def _write_stat_failure_log(output_dir, year, category, team, failures):
     """取得に失敗したスタッツを、通常のCSVとは別のログCSVに記録する。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -950,123 +770,6 @@ def _write_stat_failure_log(output_dir, year, category, team, failures):
         writer = csv.writer(csv_file)
         writer.writerow(["チーム", "選手名", "選手URL", "項目", "理由"])
         writer.writerows(failures)
-
-def collect_team_stats(year, category, team, output_dir="output", strict=False):
-    stat_types = _stat_keys_for_category(category)
-    print(f"--- Target: {year} {category} {team} ---")
-
-    # --- Step 1: 選手マスタ（ベース）の作成 ---
-    # 'game'（出場試合数）と 'score'（得点）を取得して、全選手リストを作成する
-    print("Creating player master list...")
-    base_stats = ["game", "score"]
-    master_df = None
-    base_stats_cache = {}
-
-    for st in base_stats:
-        df = fetch_stat(st, year, category, team, strict=strict)
-        if df is None or df.empty:
-            url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{st}/"
-            raise RuntimeError(f"{team}の{st}ランキング取得失敗 (URL: {url})")
-        base_stats_cache[st] = df
-
-        # 必要な基本カラムだけ抽出
-        df_base = df[["player_url", "player_name", "team_name"]].copy()
-
-        if master_df is None:
-            master_df = df_base
-        else:
-            # 選手リストを統合する。重複排除は最後にまとめて行う。
-            master_df = pd.concat([master_df, df_base], ignore_index=True)
-
-    if master_df is None or master_df.empty:
-        raise RuntimeError(f"{team}の選手マスタ作成に失敗しました (URL: https://www.jleague.jp/stats/{category}/player/{year}/{team}/game/)")
-
-    # 重複排除（マスタ作成）
-    # player_url優先で一意化し、URLが無い場合は名前+チームで一意化する
-    master_df = _dedupe_players(master_df)
-
-    print(f"Master list created: {len(master_df)} players found.")
-
-    # --- Step 2: 全スタッツを左結合していく ---
-    final_df = master_df.copy()
-    failed_stats = []
-    failure_log_rows = []
-
-    for i, st in enumerate(stat_types):
-        message = f"[{i+1}/{len(stat_types)}] データ取得中: {st}..."
-        # 前の行が長い場合に残らないよう、行をクリアしてから表示
-        sys.stdout.write("\r" + " " * 100 + "\r")
-        sys.stdout.write(message)
-        sys.stdout.flush()
-
-        if st in base_stats_cache:
-            df = base_stats_cache[st]
-        else:
-            try:
-                df = fetch_stat(st, year, category, team, strict=strict)
-            except requests.exceptions.RequestException as e:
-                # ネットワークエラーは当該項目だけを失敗として扱い、全体は継続する
-                if strict:
-                    raise
-                sys.stdout.write("\r" + " " * 100 + "\r")
-                print(f"  [取得失敗] {st}: {e}")
-                df = None
-                failed_stats.append(st)
-
-        if df is None or df.empty:
-            url = f"https://www.jleague.jp/stats/{category}/player/{year}/{team}/{st}/"
-            if strict:
-                raise RuntimeError(f"{team}の{st}ランキング取得失敗 (URL: {url})")
-            else:
-                # 非strictは0埋めで継続
-                if st not in failed_stats:
-                    sys.stdout.write("\r" + " " * 100 + "\r")
-                    print(f"  [取得失敗] {st} のランキングが空です (URL: {url})")
-                    failed_stats.append(st)
-                failure_reason = f"ランキング取得失敗 (URL: {url})"
-                failure_log_rows.extend(
-                    (team, row["player_name"], row["player_url"], st, failure_reason)
-                    for _, row in master_df.iterrows()
-                )
-                final_df[st] = 0
-                continue
-
-        # マージ用にカラムを絞る（URLはマスタにあるので不要、名前とチーム名で結合）
-        # ただし、結合用キー以外はスタッツ値だけにする
-        cols_to_use = ["player_url", "player_name", "team_name", st]
-        df_to_merge = _dedupe_players(df[cols_to_use])
-
-        # 左結合 (Left Join)
-        # これにより、マスタにいない「謎の行」が増えるのを防ぐ
-        try:
-            final_df = _merge_stat_by_key(final_df, df_to_merge, st)
-        except Exception as e:
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            print(f"  [警告] {st} の結合に失敗しました: {e}")
-            final_df[st] = 0
-            failed_stats.append(st)
-            failure_log_rows.extend(
-                (team, row["player_name"], row["player_url"], st, f"結合失敗: {e}")
-                for _, row in master_df.iterrows()
-            )
-
-    if failed_stats:
-        sys.stdout.write("\r" + " " * 100 + "\r")
-        print(
-            f"  注意: {len(failed_stats)}/{len(stat_types)} 項目を取得できませんでした。"
-            "該当列は 0 で埋めています: " + ", ".join(failed_stats)
-        )
-        if not strict:
-            print(
-                "        実際の値が 0 の選手と区別できません。"
-                "--strict を付けると取得失敗時に中断します。"
-            )
-        _write_stat_failure_log(output_dir, year, category, team, failure_log_rows)
-        if failure_log_rows:
-            print(f"  取得失敗ログ: {os.path.join(output_dir, f'stats_{team}_{year}_{category}_errors.csv')}")
-
-    print(f"\n全スタッツの取得が完了しました: {team}")
-    return final_df
 
 def main():
     parser = argparse.ArgumentParser(description="J.League Player Stats Collector")
@@ -1125,9 +828,6 @@ def main():
 
     if args.year not in SEASON_GAME_KIND_IDS:
         parser.error("選手一覧起点のスタッツ取得は --season 2026 または 2026-27 に対応しています")
-    if BeautifulSoup is None or pd is None:
-        parser.error("スタッツ取得には依存パッケージが必要です。pip install -r requirements.txt を実行してください")
-
     if args.team == "all":
         teams = get_team_list(args.year, args.category)
         if not teams:
