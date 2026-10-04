@@ -39,6 +39,14 @@ def _get_session():
         })
     return _session
 
+
+def _reset_session():
+    """切断後の接続プールを破棄し、次の試行で新しい接続を使う。"""
+    global _session
+    if _session is not None:
+        _session.close()
+        _session = None
+
 # 統計項目のコードから日本語名（単位）へのマッピング
 STAT_NAME_MAP = {
     "game": "出場試合数（試合）",
@@ -212,13 +220,13 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
     UnboundLocalError になる」「429のレスポンスをデータとして解析する」といった
     不具合があった。ループが確実に response を返すよう構造を改めた。
     """
-    session = _get_session()
     last_error = None
 
     for attempt in range(1, max_retries + 1):
         exhausted = attempt >= max_retries
         try:
-            response = session.get(url, timeout=timeout)
+            # 前回の通信が途中で切れた場合は、ここで新しい Session を取得する。
+            response = _get_session().get(url, timeout=timeout)
 
             # 429 Too Many Requests
             if response.status_code == 429:
@@ -264,6 +272,24 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
             time.sleep(wait_seconds)
             continue
 
+        except (
+            requests.exceptions.ChunkedEncodingError,
+            requests.exceptions.ConnectionError,
+        ) as e:
+            # Response ended prematurely などの途中切断では、壊れた keep-alive
+            # 接続をプールから外してから短い待機で再試行する。
+            last_error = str(e)
+            _reset_session()
+            if exhausted:
+                break
+            wait_seconds = min(attempt, 2)
+            print(
+                f"  [接続切断] {context} {wait_seconds}秒待機して新しい接続で再試行します "
+                f"({attempt}/{max_retries}): {e}"
+            )
+            time.sleep(wait_seconds)
+            continue
+
         except requests.exceptions.RequestException as e:
             # 429/5xxは上で処理済みなので、ここではその他のリクエスト例外を処理する
             # （ConnectionError, HTTPError などのサブクラスも含む）
@@ -285,9 +311,16 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
 
 
 SEASON_GAME_KIND_IDS = {
+    **{str(year): 2 for year in range(2018, 2026)},  # 通常シーズン
     "2026": 249,     # 2026特別シーズン
     "2026-27": 2,    # 2026/27シーズン
 }
+
+# 現行登録選手との照合に使うシーズン。リーグのシーズン形式変更時に更新する。
+CURRENT_PLAYER_LIST_SEASON = "2026-27"
+_current_player_ids = None
+_current_player_list_error = None
+_current_player_list_loaded = False
 
 FALLBACKS_FILE = Path(__file__).resolve().parent / "data" / "stat_fallbacks.csv"
 
@@ -360,6 +393,52 @@ def _fetch_player_roster(year, category, team):
     if not players:
         raise RuntimeError(f"選手一覧を解析できません (URL: {url})")
     return players
+
+
+def get_current_player_ids():
+    """現行J1/J2/J3の選手IDを一度だけ取得して返す。失敗時は(None, error)。"""
+    global _current_player_ids, _current_player_list_error, _current_player_list_loaded
+    if not _current_player_list_loaded:
+        _current_player_list_loaded = True
+        try:
+            player_ids = set()
+            for category in ("j1", "j2", "j3"):
+                players = _fetch_player_roster(
+                    CURRENT_PLAYER_LIST_SEASON, category, "all"
+                )
+                player_ids.update(player["player_id"] for player in players)
+            if not player_ids:
+                raise RuntimeError("現行選手一覧が空でした")
+            _current_player_ids = player_ids
+        except (requests.exceptions.RequestException, RuntimeError) as error:
+            _current_player_list_error = str(error)
+    return _current_player_ids, _current_player_list_error
+
+
+def get_players_absent_from_current_list(year, category, team):
+    """指定シーズン・チームの選手から現行J1/J2/J3一覧にない選手を返す。"""
+    if team == "all":
+        teams = get_team_list(year, category)
+        if not teams:
+            raise RuntimeError(f"{year}年{category}のチーム一覧を取得できません")
+        players = []
+        for team_slug in teams:
+            players.extend(
+                {**player, "_team_slug": team_slug}
+                for player in _fetch_player_roster(year, category, team_slug)
+            )
+    else:
+        players = [
+            {**player, "_team_slug": team}
+            for player in _fetch_player_roster(year, category, team)
+        ]
+    current_player_ids, error = get_current_player_ids()
+    if current_player_ids is None:
+        raise RuntimeError(f"現行選手一覧と照合できません: {error}")
+    return [
+        player for player in players
+        if player["player_id"] not in current_player_ids
+    ]
 
 
 def _fetch_team_stat_ranking(year, category, team, stat):
@@ -538,13 +617,31 @@ def _fetch_player_history_stats(player_id, season):
 
 
 def collect_appearances(year, category, team, output_dir="output", selected_stats=None):
-    """公式個人ページとチーム別ランキングから選手スタッツを集計する。"""
+    """公式ページの選手一覧とスタッツから選手別データを集計する。
+
+    2018年は選手個人ページの詳細スタッツがないため、チーム別ランキングのみを使う。
+    """
     if year not in SEASON_GAME_KIND_IDS:
-        raise ValueError("出場試合数の集計は 2026 または 2026-27 に対応しています")
+        raise ValueError("スタッツ取得は 2018〜2026 または 2026-27 に対応しています")
+
+    ranking_only = year == "2018"
 
     players = _fetch_player_roster(year, category, team)
     fallbacks = _load_stat_fallbacks()
     print(f"選手一覧を取得しました: {len(players)}人")
+    current_player_ids = None
+    if not ranking_only:
+        current_player_ids, current_list_error = get_current_player_ids()
+        if current_player_ids is None:
+            print(
+                "警告: 現行J1/J2/J3選手一覧と照合できないため、"
+                f"全選手の個人ページを取得します: {current_list_error}"
+            )
+        else:
+            absent_count = sum(
+                player["player_id"] not in current_player_ids for player in players
+            )
+            print(f"現行J1/J2/J3選手一覧に掲載なし: {absent_count}人")
     # チームで絞った公式ランキングを使うことで、移籍前後を分けたチーム在籍時の値を取る。
     # ポジションに存在する項目だけ取得し、同じチームの選手間ではランキングを共有する。
     selected_stats = set(selected_stats or STAT_NAME_MAP)
@@ -568,35 +665,75 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
     rows = []
     errors = []
     for index, player in enumerate(players, start=1):
-        print(f"[{index}/{len(players)}] {player['player_name']} の出場履歴を取得中")
+        absent_from_current_list = (
+            not ranking_only
+            and current_player_ids is not None
+            and player["player_id"] not in current_player_ids
+        )
+        task = (
+            "スタッツを集計中" if ranking_only
+            else "個人ページを省略（現行一覧になし）" if absent_from_current_list
+            else "出場履歴を取得中"
+        )
+        print(f"[{index}/{len(players)}] {player['player_name']} の{task}")
         player_url = f"https://www.jleague.jp/player/{player['player_id']}/?navicode=j1#stats"
-        try:
-            player_stats = _fetch_player_history_stats(player["player_id"], year)
-            source_type = "選手個人ページ"
-            source_url = player_url
-            fetch_error = None
-        except (requests.exceptions.RequestException, RuntimeError) as e:
+        if ranking_only or absent_from_current_list:
             player_stats = {
-                # 取得できなかった値を実績ゼロと区別する。ランキングや補完値で
-                # 後から取得できた項目は、この None が実値に置き換わる。
-                key: None
-                for key in STAT_NAME_MAP
+                key: None for key in STAT_NAME_MAP
             }
-            source_type = "未取得"
+            source_type = (
+                "公式チーム別ランキングのみ"
+                if ranking_only else "現行一覧なし（個人ページ省略）"
+            )
             source_url = ""
-            fetch_error = str(e)
+            fetch_error = (
+                None if ranking_only
+                else "現行J1/J2/J3選手一覧に掲載なしのため個人ページ取得を省略"
+            )
+            player_page_failed = absent_from_current_list
+        else:
+            try:
+                player_stats = _fetch_player_history_stats(player["player_id"], year)
+                source_type = "選手個人ページ"
+                source_url = player_url
+                fetch_error = None
+                player_page_failed = False
+            except (requests.exceptions.RequestException, RuntimeError) as e:
+                player_stats = {
+                    # 取得できなかった値を実績ゼロと区別する。ランキングや補完値で
+                    # 後から取得できた項目は、この None が実値に置き換わる。
+                    key: None
+                    for key in STAT_NAME_MAP
+                }
+                source_type = "未取得"
+                source_url = ""
+                fetch_error = str(e)
+                player_page_failed = True
 
         player_fallbacks = {
             key[4]: value for key, value in fallbacks.items()
             if key[:4] == (year, category, team, player["player_id"])
         }
         # 成功した公式チーム別ランキングは、個人ページのシーズン合計より優先する。
-        # ランキングに選手がいない場合は、順位外として0を記録する。
+        # 個人ページの取得にも失敗した場合、ランキングに選手がいない値は未取得のままにする。
         for stat, (ranking, ranking_url) in team_rankings.items():
             if _is_stat_applicable(stat, player.get("position", "")):
-                player_stats[stat] = ranking.get(player["player_id"], 0)
-                if stat == "game":
-                    source_type = "公式チーム別スタッツ"
+                player_id = player["player_id"]
+                if player_id in ranking:
+                    player_stats[stat] = ranking[player_id]
+                elif ranking_only or not player_page_failed:
+                    # ページを正常取得できた場合（またはランキングのみで集計する2018年）は、
+                    # ランキングに載らないことを0として扱える。
+                    player_stats[stat] = 0
+                if ranking_only and not source_url:
+                    source_url = ranking_url
+                if stat == "game" and (
+                    ranking_only or not player_page_failed or player_id in ranking
+                ):
+                    source_type = (
+                        "公式チーム別ランキングのみ"
+                        if ranking_only else "公式チーム別スタッツ"
+                    )
                     source_url = ranking_url
         for stat, fallback in player_fallbacks.items():
             if stat not in STAT_NAME_MAP:
@@ -614,9 +751,15 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                 if _is_stat_applicable(stat, player.get("position", ""))
                 and (category == "j1" or stat not in J1_ONLY_PHYSICAL_STAT_KEYS)
             }
-            available_stats = set(team_rankings) | set(player_fallbacks)
-            if not required_stats.issubset(available_stats):
-                errors.append((player["player_id"], player["player_name"], fetch_error))
+            missing_stats = sorted(
+                stat for stat in required_stats if player_stats.get(stat) is None
+            )
+            if missing_stats:
+                missing_names = ", ".join(STAT_NAME_MAP[stat] for stat in missing_stats)
+                errors.append((
+                    player["player_id"], player["player_name"],
+                    f"個人ページ取得失敗（{fetch_error}）。ランキング・補完値にもデータなし: {missing_names}",
+                ))
         if ranking_errors:
             for stat, error in ranking_errors.items():
                 if stat in selected_stats and _is_stat_applicable(stat, player.get("position", "")):

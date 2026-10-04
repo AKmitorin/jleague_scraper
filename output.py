@@ -1,6 +1,30 @@
 import csv
 import os
 
+
+def write_inactive_player_csv(output_dir, year, category, team, players):
+    """現行J1/J2/J3選手一覧にない過去選手をCSVに保存する。"""
+    os.makedirs(output_dir, exist_ok=True)
+    filepath = os.path.join(
+        output_dir, f"players_not_current_{team}_{year}_{category}.csv"
+    )
+    with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([
+            "対象シーズン", "対象カテゴリ", "対象チーム", "選手ID", "選手名",
+            "ポジション", "選手URL", "現行J1/J2/J3一覧",
+        ])
+        for player in players:
+            player_id = player["player_id"]
+            writer.writerow([
+                year, category, player.get("_team_slug", team), player_id, player["player_name"],
+                player.get("position", ""),
+                f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats",
+                "掲載なし",
+            ])
+    return filepath
+
+
 def write_stat_failure_log(output_dir, year, category, team, failures):
     """取得に失敗したスタッツを通常のCSVとは別に記録する。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -21,13 +45,15 @@ def write_stats_csv(
     os.makedirs(output_dir, exist_ok=True)
     filename = f"stats_{team}_{year}_{category}.csv"
     filepath = os.path.join(output_dir, filename)
+    source_type_label = "スタッツの取得方法" if year == "2018" else "出場試合数の取得方法"
+    source_url_label = "スタッツ出典URL" if year == "2018" else "出場試合数の出典URL"
     columns = [
         ("player_url", "選手URL"),
         ("player_name", "選手名"),
         ("team_name", "チーム名"),
         *((stat, stat_names[stat]) for stat in selected_stats),
-        ("source_type", "出場試合数の取得方法"),
-        ("source_url", "出場試合数の出典URL"),
+        ("source_type", source_type_label),
+        ("source_url", source_url_label),
     ]
 
     def csv_value(row, key):

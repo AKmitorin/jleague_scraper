@@ -2,6 +2,8 @@ import argparse
 import re
 import sys
 
+import requests
+
 from scraper import (
     J1_ONLY_PHYSICAL_STAT_KEYS,
     SEASON_GAME_KIND_IDS,
@@ -9,9 +11,10 @@ from scraper import (
     _is_stat_applicable,
     _stat_keys_for_category,
     collect_appearances,
+    get_players_absent_from_current_list,
     get_team_list,
 )
-from output import write_stats_csv
+from output import write_inactive_player_csv, write_stats_csv
 
 def _normalize_year(value):
     """シーズン文字列を正規化する。全角数字は半角に変換する。
@@ -61,11 +64,11 @@ def interactive_wizard():
 
     # 年
     while True:
-        year = prompt_input("取得したいシーズン（例: 2025 / 2026-27）", "2026-27")
+        year = prompt_input("取得したいシーズン（例: 2018 / 2025 / 2026-27）", "2026-27")
         year = _normalize_year(year)
-        if _is_valid_year(year) or year in SEASON_GAME_KIND_IDS:
+        if year in SEASON_GAME_KIND_IDS:
             break
-        print("  4桁の半角数字または 2026-27 を入力してください。")
+        print("  2018〜2026 または 2026-27 を入力してください。")
 
     # カテゴリ
     while True:
@@ -108,13 +111,17 @@ def interactive_wizard():
 
 def main():
     parser = argparse.ArgumentParser(description="J.League Player Stats Collector")
-    parser.add_argument("--season", dest="year", default="2026-27", help="取得したいシーズン（例: 2025 / 2026-27）")
+    parser.add_argument("--season", dest="year", default="2026-27", help="取得したいシーズン（例: 2018 / 2025 / 2026-27）")
     parser.add_argument("--category", default="j1", choices=["j1", "j2", "j3"], help="カテゴリ（j1 / j2 / j3）")
     parser.add_argument("--team", default="shimizu", help="チームスラッグ（例: shimizu / kashima / all）")
     parser.add_argument("--output", default="output", help="保存先フォルダ（例: output）")
     parser.add_argument("--interactive", action="store_true", help="対話式ウィザードで実行する")
     parser.add_argument("--list-teams", action="store_true", help="チーム一覧を表示して終了する")
     parser.add_argument("--list-stats", action="store_true", help="指定カテゴリで取得可能なスタッツ項目を表示して終了する")
+    parser.add_argument(
+        "--list-inactive-players", action="store_true",
+        help="指定シーズンの選手から現行J1/J2/J3一覧にない選手をCSV出力する",
+    )
     parser.add_argument(
         "--stats", default="all",
         help="取得するスタッツ項目（カンマ区切り。デフォルト: 全項目）",
@@ -161,8 +168,34 @@ def main():
             print(f"  {stat}\t{STAT_NAME_MAP[stat]}")
         return
 
+    if args.list_inactive_players:
+        if args.year not in SEASON_GAME_KIND_IDS:
+            parser.error("--list-inactive-players は --season 2018〜2026 または 2026-27 に対応しています")
+        try:
+            inactive_players = get_players_absent_from_current_list(
+                args.year, args.category, args.team
+            )
+        except (requests.exceptions.RequestException, RuntimeError) as error:
+            print(f"現行選手一覧との照合に失敗しました: {error}")
+            return
+        filepath = write_inactive_player_csv(
+            args.output, args.year, args.category, args.team, inactive_players
+        )
+        print(
+            f"現行J1/J2/J3選手一覧に掲載されていない選手: "
+            f"{len(inactive_players)}人"
+        )
+        print(f"一覧CSV: {filepath}")
+        if inactive_players:
+            sample = ", ".join(
+                f"{player['player_name']} ({player['player_id']})"
+                for player in inactive_players[:10]
+            )
+            print(f"例: {sample}" + (" ..." if len(inactive_players) > 10 else ""))
+        return
+
     if args.year not in SEASON_GAME_KIND_IDS:
-        parser.error("選手一覧起点のスタッツ取得は --season 2026 または 2026-27 に対応しています")
+        parser.error("スタッツ取得は --season 2018〜2026 または 2026-27 に対応しています")
     if args.team == "all":
         teams = get_team_list(args.year, args.category)
         if not teams:
