@@ -2,3 +2,4 @@ venv/*
 output/*
 mise.toml
 __pycache__/*
+data/*
