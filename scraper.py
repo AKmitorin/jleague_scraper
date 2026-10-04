@@ -1,11 +1,9 @@
-import csv
 import json
 import os
 import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 
 import requests
 
@@ -322,38 +320,6 @@ _current_player_ids = None
 _current_player_list_error = None
 _current_player_list_loaded = False
 
-FALLBACKS_FILE = Path(__file__).resolve().parent / "data" / "stat_fallbacks.csv"
-
-
-def _load_stat_fallbacks():
-    """外部CSVの補完値を (season, category, team, player_id, stat) で索引化する。"""
-    fallbacks = {}
-    if not FALLBACKS_FILE.exists():
-        return fallbacks
-
-    with FALLBACKS_FILE.open(newline="", encoding="utf-8-sig") as csv_file:
-        for row_number, row in enumerate(csv.DictReader(csv_file), start=2):
-            key = tuple(row[field].strip() for field in (
-                "season", "category", "team", "player_id", "stat"
-            ))
-            if not all(key):
-                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: 必須項目が空です")
-            if key in fallbacks:
-                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: 補完キーが重複しています: {key}")
-            try:
-                value = float(row["value"])
-                if value.is_integer():
-                    value = int(value)
-            except (TypeError, ValueError):
-                raise ValueError(f"{FALLBACKS_FILE}:{row_number}: value が数値ではありません")
-            fallbacks[key] = {
-                "value": value,
-                "source_type": row["source_type"].strip(),
-                "source_url": row["source_url"].strip(),
-            }
-    return fallbacks
-
-
 def _fetch_player_roster(year, category, team):
     """選手スタッツページの選手フィルターから選手IDと名前を取得する。"""
     url = (
@@ -636,7 +602,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
     ranking_only = year == "2018"
 
     players = _fetch_player_roster(year, category, team)
-    fallbacks = _load_stat_fallbacks()
     print(f"選手一覧を取得しました: {len(players)}人")
     current_player_ids = None
     if not ranking_only:
@@ -709,7 +674,7 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                 player_page_failed = False
             except (requests.exceptions.RequestException, RuntimeError) as e:
                 player_stats = {
-                    # 取得できなかった値を実績ゼロと区別する。ランキングや補完値で
+                    # 取得できなかった値を実績ゼロと区別する。ランキングで
                     # 後から取得できた項目は、この None が実値に置き換わる。
                     key: None
                     for key in STAT_NAME_MAP
@@ -719,10 +684,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                 fetch_error = str(e)
                 player_page_failed = True
 
-        player_fallbacks = {
-            key[4]: value for key, value in fallbacks.items()
-            if key[:4] == (year, category, team, player["player_id"])
-        }
         # 成功した公式チーム別ランキングは、個人ページのシーズン合計より優先する。
         # 個人ページの取得にも失敗した場合、ランキングに選手がいない値は未取得のままにする。
         for stat, (ranking, ranking_url) in team_rankings.items():
@@ -744,15 +705,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                         if ranking_only else "公式チーム別スタッツ"
                     )
                     source_url = ranking_url
-        for stat, fallback in player_fallbacks.items():
-            if stat not in STAT_NAME_MAP:
-                continue
-            if fallback["source_type"] == "公式チーム別スタッツ" or source_type == "未取得" or player_stats.get(stat) is None:
-                player_stats[stat] = fallback["value"]
-            if stat == "game" and (source_type == "未取得" or fallback["source_type"] == "公式チーム別スタッツ"):
-                source_type = fallback["source_type"]
-                source_url = fallback["source_url"]
-
         if fetch_error:
             required_stats = {
                 stat for stat in STAT_NAME_MAP
@@ -767,7 +719,7 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                 missing_names = ", ".join(STAT_NAME_MAP[stat] for stat in missing_stats)
                 errors.append((
                     player["player_id"], player["player_name"],
-                    f"個人ページ取得失敗（{fetch_error}）。ランキング・補完値にもデータなし: {missing_names}",
+                    f"個人ページ取得失敗（{fetch_error}）。ランキングにもデータなし: {missing_names}",
                 ))
         if ranking_errors:
             for stat, error in ranking_errors.items():
