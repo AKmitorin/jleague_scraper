@@ -51,15 +51,11 @@ def write_stats_csv(
     os.makedirs(output_dir, exist_ok=True)
     filename = f"stats_{team}_{year}_{category}.csv"
     filepath = os.path.join(output_dir, filename)
-    source_type_label = "スタッツの取得方法" if year == "2018" else "出場試合数の取得方法"
-    source_url_label = "スタッツ出典URL" if year == "2018" else "出場試合数の出典URL"
     columns = [
         ("player_url", "選手URL"),
         ("player_name", "選手名"),
         ("team_name", "チーム名"),
         *((stat, stat_names[stat]) for stat in selected_stats),
-        ("source_type", source_type_label),
-        ("source_url", source_url_label),
     ]
 
     def csv_value(row, key):

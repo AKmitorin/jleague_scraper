@@ -439,7 +439,7 @@ def _fetch_team_stat_ranking(year, category, team, stat):
             value = _parse_stat_number(match.group(1))
             if value is not None:
                 values[match.group(2)] = value
-    return values, url
+    return values
 
 
 PLAYER_HISTORY_STAT_KEYS = {
@@ -655,11 +655,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
             player_stats = {
                 key: None for key in STAT_NAME_MAP
             }
-            source_type = (
-                "公式チーム別ランキングのみ"
-                if ranking_only else "現行一覧なし（個人ページ省略）"
-            )
-            source_url = ""
             fetch_error = (
                 None if ranking_only
                 else "現行J1/J2/J3選手一覧に掲載なしのため個人ページ取得を省略"
@@ -668,8 +663,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
         else:
             try:
                 player_stats = _fetch_player_history_stats(player["player_id"], year)
-                source_type = "選手個人ページ"
-                source_url = player_url
                 fetch_error = None
                 player_page_failed = False
             except (requests.exceptions.RequestException, RuntimeError) as e:
@@ -679,14 +672,12 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                     key: None
                     for key in STAT_NAME_MAP
                 }
-                source_type = "未取得"
-                source_url = ""
                 fetch_error = str(e)
                 player_page_failed = True
 
         # 成功した公式チーム別ランキングは、個人ページのシーズン合計より優先する。
         # 個人ページの取得にも失敗した場合、ランキングに選手がいない値は未取得のままにする。
-        for stat, (ranking, ranking_url) in team_rankings.items():
+        for stat, ranking in team_rankings.items():
             if _is_stat_applicable(stat, player.get("position", "")):
                 player_id = player["player_id"]
                 if player_id in ranking:
@@ -695,16 +686,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                     # ページを正常取得できた場合（またはランキングのみで集計する2018年）は、
                     # ランキングに載らないことを0として扱える。
                     player_stats[stat] = 0
-                if ranking_only and not source_url:
-                    source_url = ranking_url
-                if stat == "game" and (
-                    ranking_only or not player_page_failed or player_id in ranking
-                ):
-                    source_type = (
-                        "公式チーム別ランキングのみ"
-                        if ranking_only else "公式チーム別スタッツ"
-                    )
-                    source_url = ranking_url
         if fetch_error:
             required_stats = {
                 stat for stat in STAT_NAME_MAP
@@ -736,8 +717,6 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                 "shimizu": "清水エスパルス",
                 "yokohamafc": "横浜FC",
             }.get(team, team),
-            "source_type": source_type,
-            "source_url": source_url,
             "_position": player.get("position", ""),
             "_team_slug": team,
             "_absent_from_current_list": absent_from_current_list,
