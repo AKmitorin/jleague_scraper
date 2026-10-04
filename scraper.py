@@ -777,6 +777,7 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
                         f"{STAT_NAME_MAP[stat]}のチーム別ランキング取得失敗: {error}",
                     ))
         row = {
+            "player_id": player["player_id"],
             "player_url": player_url,
             "player_name": player["player_name"],
             "team_name": {
@@ -786,6 +787,8 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
             "source_type": source_type,
             "source_url": source_url,
             "_position": player.get("position", ""),
+            "_team_slug": team,
+            "_absent_from_current_list": absent_from_current_list,
         }
         row.update({key: value for key, value in player_stats.items() if key in selected_stats})
         if category in ("j2", "j3"):

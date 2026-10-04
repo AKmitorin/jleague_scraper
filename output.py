@@ -25,6 +25,12 @@ def write_inactive_player_csv(output_dir, year, category, team, players):
     return filepath
 
 
+def write_auto_inactive_player_csv(output_dir, year, category, team, players):
+    """通常取得で検出した現行Jリーグ一覧にない選手をCSVに保存する。"""
+    inactive = [player for player in players if player.get("_absent_from_current_list")]
+    return write_inactive_player_csv(output_dir, year, category, team, inactive)
+
+
 def write_stat_failure_log(output_dir, year, category, team, failures):
     """取得に失敗したスタッツを通常のCSVとは別に記録する。"""
     os.makedirs(output_dir, exist_ok=True)

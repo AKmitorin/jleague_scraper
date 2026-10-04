@@ -14,7 +14,7 @@ from scraper import (
     get_players_absent_from_current_list,
     get_team_list,
 )
-from output import write_inactive_player_csv, write_stats_csv
+from output import write_auto_inactive_player_csv, write_inactive_player_csv, write_stats_csv
 
 def _normalize_year(value):
     """シーズン文字列を正規化する。全角数字は半角に変換する。
@@ -225,6 +225,13 @@ def main():
     )
     print(f"\nSUCCESS: Saved to {filepath}")
     print(f"Total players: {len(all_rows)}")
+    if args.year != "2018":
+        inactive_rows = [row for row in all_rows if row.get("_absent_from_current_list")]
+        inactive_filepath = write_auto_inactive_player_csv(
+            "data", args.year, args.category, args.team, all_rows
+        )
+        print(f"現行Jリーグ一覧に掲載されていない選手: {len(inactive_rows)}人")
+        print(f"一覧CSV: {inactive_filepath}")
     return
 
 if __name__ == "__main__":
