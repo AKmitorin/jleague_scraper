@@ -453,17 +453,26 @@ def _fetch_team_stat_ranking(year, category, team, stat):
     if r'\"rankingList\"' not in html:
         raise RuntimeError(f"チーム別ランキングが見つかりません (URL: {url})")
 
-    # ペイロードはエスケープ済みJSON。順位表に載らない選手も、正常取得時は0と判定する。
-    pattern = re.compile(
-        r'\\"href\\":\\"/player/(\d+)/\\".*?'
-        r'\\"points\\":([0-9]+(?:\.[0-9]+)?)',
-        re.DOTALL,
-    )
+    # 順位表の選手行は、通常 href で選手IDを持つが、過去シーズンの一部行は
+    # href が省略され legacyPlayerPhotoLookup.playerId にのみIDがある。
     values = {}
-    for match in pattern.finditer(html):
-        value = _parse_stat_number(match.group(2))
-        if value is not None:
-            values[match.group(1)] = value
+    patterns = (
+        re.compile(
+            r'\\"playerName\\":\\".*?\\",\\"rank\\":\d+,\\"ranking\\":\d+,\\"points\\":'
+            r'([0-9]+(?:\.[0-9]+)?).*?\\"playerId\\":\\"(\d+)\\"',
+            re.DOTALL,
+        ),
+        re.compile(
+            r'"playerName":".*?","rank":\d+,"ranking":\d+,"points":'
+            r'([0-9]+(?:\.[0-9]+)?).*?"playerId":"(\d+)"',
+            re.DOTALL,
+        ),
+    )
+    for pattern in patterns:
+        for match in pattern.finditer(html):
+            value = _parse_stat_number(match.group(1))
+            if value is not None:
+                values[match.group(2)] = value
     return values, url
 
 
