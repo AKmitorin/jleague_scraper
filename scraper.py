@@ -214,6 +214,8 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
       - 5xx サーバーエラー（指数バックオフ）
       - タイムアウト / 接続エラー（指数バックオフ）
 
+    429以外の4xxクライアントエラー（404など）はリトライしても成功しないため、即エラーにする。
+
     旧実装には「全試行がタイムアウトだと response が未代入のまま参照され
     UnboundLocalError になる」「429のレスポンスをデータとして解析する」といった
     不具合があった。ループが確実に response を返すよう構造を改めた。
@@ -288,9 +290,18 @@ def _request_with_retry(url, context="", max_retries=MAX_RETRIES, timeout=REQUES
             time.sleep(wait_seconds)
             continue
 
+        except requests.exceptions.HTTPError as e:
+            # 429/5xxは上で処理済みなので、ここに来るのは4xxクライアントエラーのみ
+            # （404など）。リトライしても成功しないため、即エラーとする。
+            status_code = e.response.status_code if e.response is not None else "不明"
+            raise requests.exceptions.RequestException(
+                f"{context} リクエストがHTTP {status_code}で失敗しました"
+                f"（クライアントエラーのためリトライしません）: {e}"
+            ) from e
+
         except requests.exceptions.RequestException as e:
-            # 429/5xxは上で処理済みなので、ここではその他のリクエスト例外を処理する
-            # （ConnectionError, HTTPError などのサブクラスも含む）
+            # 429/5xx/4xxは上で処理済みなので、ここではその他のリクエスト例外を処理する
+            # （ConnectionErrorなどのサブクラスも含む）
             last_error = str(e)
             if exhausted:
                 break
