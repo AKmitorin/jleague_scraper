@@ -144,14 +144,24 @@ def _stat_keys_for_category(category):
         return [key for key in STAT_NAME_MAP if key not in J1_ONLY_PHYSICAL_STAT_KEYS]
     return list(STAT_NAME_MAP)
 
-def get_team_list(year, category):
-    """現行の公式スタッツページからクラブ選択肢のスラッグ一覧を取得する。"""
+_team_name_maps = {}
+
+
+def _team_name_map(year, category):
+    """クラブスラッグから公式チーム名へのマッピングを返す（実行内キャッシュ）。
+
+    現行サイトは select 要素ではなく、Next.js の RSC ペイロードに
+    id="club" の選択肢（value: スラッグ, label: 正式名）を JSON として
+    埋め込んでいる。取得・解析に失敗した場合は空のマッピングを返す。
+    """
+    key = (year, category)
+    if key in _team_name_maps:
+        return _team_name_maps[key]
+    name_map = {}
     url = f"https://www.jleague.jp/{category}/stats/player/{year}/score/search-list/"
     try:
         response = _get_session().get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        # 現行サイトは select 要素ではなく、Next.js の RSC ペイロードに
-        # id="club" の選択肢を JSON として埋め込んでいる。
         payload = response.text.replace(r'\"', '"')
         club_options = re.search(
             r'"id":"club".*?"id":"club-all".*?"options":(\[.*?\])',
@@ -160,23 +170,32 @@ def get_team_list(year, category):
         )
         if club_options:
             options = json.loads(club_options.group(1))
-            teams = [option.get("value", "") for option in options]
-            teams = [team for team in teams if team and team != "all"]
-            if teams:
-                return teams
-
-        print(
-            f"警告: クラブ一覧データが見つかりません (URL: {url})。"
-            "サイトの構造変更が考えられます。"
-        )
-        return []
+            for option in options:
+                slug = option.get("value", "")
+                if slug and slug != "all":
+                    name_map[slug] = option.get("label") or slug
+        else:
+            print(
+                f"警告: クラブ一覧データが見つかりません (URL: {url})。"
+                "サイトの構造変更が考えられます。"
+            )
     except requests.exceptions.RequestException as e:
         # ネットワークエラーとHTTPエラーを区別して報告する
         print(f"チーム一覧の取得に失敗しました（ネットワークまたはHTTPエラー）: {e}")
-        return []
     except Exception as e:
         print(f"チーム一覧の解析中に予期しないエラーが発生しました: {e}")
-        return []
+    _team_name_maps[key] = name_map
+    return name_map
+
+
+def get_team_list(year, category):
+    """現行の公式スタッツページからクラブ選択肢のスラッグ一覧を取得する。"""
+    return list(_team_name_map(year, category))
+
+
+def get_team_name(year, category, slug):
+    """クラブスラッグに対応する公式チーム名を返す。不明な場合はスラッグを返す。"""
+    return _team_name_map(year, category).get(slug, slug)
 
 def _parse_retry_after(headers):
     """Retry-Afterヘッダの値から待機秒数を返す。
@@ -724,10 +743,7 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
             "player_id": player["player_id"],
             "player_url": player_url,
             "player_name": player["player_name"],
-            "team_name": {
-                "shimizu": "清水エスパルス",
-                "yokohamafc": "横浜FC",
-            }.get(team, team),
+            "team_name": get_team_name(year, category, team),
             "_position": player.get("position", ""),
             "_team_slug": team,
             "_absent_from_current_list": absent_from_current_list,
