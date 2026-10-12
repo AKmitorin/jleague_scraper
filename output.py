@@ -1,13 +1,14 @@
 import csv
 import os
 
+def prepare_output_path(output_dir, filename):
+    '''保存先フォルダを作り、ファイルのパスを返す'''
+    os.makedirs(output_dir, exist_ok=True)
+    return os.path.join(output_dir, filename)
 
 def write_inactive_player_csv(output_dir, year, category, team, players):
     """現行J1/J2/J3選手一覧にない過去選手をCSVに保存する。"""
-    os.makedirs(output_dir, exist_ok=True)
-    filepath = os.path.join(
-        output_dir, f"players_not_current_{team}_{year}_{category}.csv"
-    )
+    filepath = prepare_output_path(output_dir, f"players_not_current_{team}_{year}_{category}.csv")
     with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow([
@@ -19,7 +20,7 @@ def write_inactive_player_csv(output_dir, year, category, team, players):
             writer.writerow([
                 year, category, player.get("_team_slug", team), player_id, player["player_name"],
                 player.get("position", ""),
-                f"https://www.jleague.jp/player/{player_id}/?navicode=j1#stats",
+                f"https://www.jleague.jp/player/{player_id}/",
                 "掲載なし",
             ])
     return filepath
@@ -33,8 +34,7 @@ def write_auto_inactive_player_csv(output_dir, year, category, team, players):
 
 def write_stat_failure_log(output_dir, year, category, team, failures):
     """取得に失敗したスタッツを通常のCSVとは別に記録する。"""
-    os.makedirs(output_dir, exist_ok=True)
-    filepath = os.path.join(output_dir, f"stats_{team}_{year}_{category}_errors.csv")
+    filepath = prepare_output_path(output_dir, f"stats_{team}_{year}_{category}_errors.csv")
     if not failures and not os.path.exists(filepath):
         return
     with open(filepath, "w", newline="", encoding="utf-8-sig") as csv_file:
@@ -48,9 +48,7 @@ def write_stats_csv(
     stat_names, physical_stat_keys, is_stat_applicable,
 ):
     """選手スタッツをExcelで開けるUTF-8 BOM付きCSVに保存する。"""
-    os.makedirs(output_dir, exist_ok=True)
-    filename = f"stats_{team}_{year}_{category}.csv"
-    filepath = os.path.join(output_dir, filename)
+    filepath = prepare_output_path(output_dir, f"stats_{team}_{year}_{category}.csv")
     columns = [
         ("player_url", "選手URL"),
         ("player_name", "選手名"),
