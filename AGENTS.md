@@ -20,7 +20,12 @@ Use Python 3.12 or newer, four spaces for indentation, and descriptive `snake_ca
 
 ## Testing
 
-No automated test suite is currently present. For changes to parsing or CSV behavior, perform a focused manual check with a narrow team/stat selection, then inspect the generated CSV and error log. Avoid unnecessary broad scrapes; they make many network requests. If adding tests, use `pytest`, name files `test_*.py`, and keep network-dependent checks opt-in or mocked.
+Run the automated suite from the repository root:
+
+- `python -m pytest` runs all tests in `tests/`.
+- `pip install -r requirements-dev.txt` installs pytest alongside runtime deps.
+
+Tests must not touch the network. HTTP access is stubbed by monkeypatching `scraper._request_with_retry` and `scraper._get_session`; parser tests use trimmed real-page HTML under `tests/fixtures/`. Add new parser/CSV cases when changing parsing or output behavior, and keep each test focused. When a change touches retrieval or CSV behavior beyond the suite, still do a narrow manual check (`--team <one team> --stats <a few>`) and inspect the generated CSV and error log. Avoid unnecessary broad scrapes; they make many network requests.
 
 ## Commits and Pull Requests
 

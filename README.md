@@ -53,6 +53,17 @@ cd jleague_scraper
 pip install -r requirements.txt
 ```
 
+## テスト
+
+`tests/` に pytest のテストがあります。開発用の依存を入れて実行します。
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+テストはネットワークへアクセスしません。`tests/fixtures/` に置いた実際のページHTMLの抜粋で解析処理を、ダミーのセッションでHTTPリトライを検証します。
+
 ## 使い方
 
 ### シーズン別スタッツの取得
@@ -164,7 +175,7 @@ https://www.jleague.jp/stats/{j1|j2|j3}/player/{year}/{team_id}/{stats_category}
 ```
 
 の `{team_id}` 部分を指定してください。
-`--list-team`引数をつけるとチーム一覧が表示されるのでそちらも活用してください。
+`--list-teams`引数をつけるとチーム一覧が表示されるのでそちらも活用してください。
 
 ## 注意事項
 
@@ -182,7 +193,7 @@ https://www.jleague.jp/stats/{j1|j2|j3}/player/{year}/{team_id}/{stats_category}
 - `チーム一覧の取得に失敗しました`  
   ネットワークが不安定な場合に発生します。時間をおいて再実行してください。
 - `... ランキング取得失敗 (URL: ...)` と表示されて止まる  
-  上記の「重要」節のとおり、サイト側の構造変更が原因の場合があります。
+  サイト側の構造変更が原因の場合があります。その場合は `--team all` を避け、チームを1つに絞って再実行して切り分けてください。
 - `--season は4桁の半角数字で指定してください`  
   `--season` には2018〜2026の4桁の半角数字または `2026-27` を指定してください。2017年以前は対象外です。
 
