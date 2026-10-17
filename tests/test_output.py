@@ -8,7 +8,7 @@ import csv
 import os
 
 import output
-import scraper
+import stat_definitions
 
 
 def _read_csv(path):
@@ -42,9 +42,9 @@ def test_write_stats_csv_headers_and_missing_values(tmp_path):
         "2025",
         "j2",
         ["game", "assist", "save_count", "distance"],
-        scraper.STAT_NAME_MAP,
-        scraper.J1_ONLY_PHYSICAL_STAT_KEYS,
-        scraper._is_stat_applicable,
+        stat_definitions.STAT_NAME_MAP,
+        stat_definitions.J1_ONLY_PHYSICAL_STAT_KEYS,
+        stat_definitions.is_stat_applicable,
     )
 
     data = _read_csv(filepath)
@@ -80,9 +80,9 @@ def test_write_stats_csv_j1_marks_missing_physical_as_dash(tmp_path):
         "2025",
         "j1",
         ["distance"],
-        scraper.STAT_NAME_MAP,
-        scraper.J1_ONLY_PHYSICAL_STAT_KEYS,
-        scraper._is_stat_applicable,
+        stat_definitions.STAT_NAME_MAP,
+        stat_definitions.J1_ONLY_PHYSICAL_STAT_KEYS,
+        stat_definitions.is_stat_applicable,
     )
     assert _read_csv(filepath)[1][3] == "-"
 

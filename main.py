@@ -4,17 +4,17 @@ import sys
 
 import requests
 
-from scraper import (
+from output import write_auto_inactive_player_csv, write_inactive_player_csv, write_stats_csv
+from player_stats import get_players_absent_from_current_list
+from scraper import collect_appearances
+from stat_definitions import (
     J1_ONLY_PHYSICAL_STAT_KEYS,
     SEASON_GAME_KIND_IDS,
     STAT_NAME_MAP,
-    _is_stat_applicable,
-    _stat_keys_for_category,
-    collect_appearances,
-    get_players_absent_from_current_list,
-    get_team_list,
+    is_stat_applicable,
+    stat_keys_for_category,
 )
-from output import write_auto_inactive_player_csv, write_inactive_player_csv, write_stats_csv
+from team_names import get_team_list
 
 def _normalize_year(value):
     """シーズン文字列を正規化する。全角数字は半角に変換する。
@@ -164,7 +164,7 @@ def main():
 
     if args.list_stats:
         print(f"取得可能なスタッツ項目（{args.category}）:")
-        for stat in _stat_keys_for_category(args.category):
+        for stat in stat_keys_for_category(args.category):
             print(f"  {stat}\t{STAT_NAME_MAP[stat]}")
         return
 
@@ -221,7 +221,7 @@ def main():
         return
     filepath = write_stats_csv(
         all_rows, args.output, args.team, args.year, args.category, selected_stats,
-        STAT_NAME_MAP, J1_ONLY_PHYSICAL_STAT_KEYS, _is_stat_applicable,
+        STAT_NAME_MAP, J1_ONLY_PHYSICAL_STAT_KEYS, is_stat_applicable,
     )
     print(f"\nSUCCESS: Saved to {filepath}")
     print(f"Total players: {len(all_rows)}")

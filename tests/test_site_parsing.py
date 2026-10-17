@@ -1,4 +1,4 @@
-"""scraper.py の「解析」まわりのテスト。
+"""サイト解析まわりのテスト（player_stats / team_names / stat_definitions）。
 
 Jリーグ公式サイトのHTMLはちょっとした改修で構造が変わり、しかもその変化に
 気づきにくい（気づくとCSVが空欄だらけになる）。そこで、実際のページから
@@ -7,7 +7,9 @@ Jリーグ公式サイトのHTMLはちょっとした改修で構造が変わり
 
 import pytest
 
-import scraper
+import player_stats
+import stat_definitions
+import team_names
 from conftest import load_fixture, make_fake_response
 
 
@@ -28,7 +30,7 @@ from conftest import load_fixture, make_fake_response
     ],
 )
 def test_parse_stat_number(raw, expected):
-    assert scraper._parse_stat_number(raw) == expected
+    assert player_stats._parse_stat_number(raw) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -36,21 +38,21 @@ def test_parse_stat_number(raw, expected):
 # ---------------------------------------------------------------------------
 def test_is_stat_applicable_by_position():
     # GK専用項目は GK のみ、それ以外のポジションでは対象外
-    assert scraper._is_stat_applicable("save_count", "GK") is True
-    assert scraper._is_stat_applicable("save_count", "FW") is False
+    assert stat_definitions.is_stat_applicable("save_count", "GK") is True
+    assert stat_definitions.is_stat_applicable("save_count", "FW") is False
     # 全ポジション共通の項目
-    assert scraper._is_stat_applicable("game", "GK") is True
-    assert scraper._is_stat_applicable("game", "MF") is True
+    assert stat_definitions.is_stat_applicable("game", "GK") is True
+    assert stat_definitions.is_stat_applicable("game", "MF") is True
     # ポジション不明（空文字）は安全側に倒して対象扱い
-    assert scraper._is_stat_applicable("save_count", "") is True
+    assert stat_definitions.is_stat_applicable("save_count", "") is True
 
 
 def test_stat_keys_for_category_excludes_physical_for_j2_j3():
-    assert set(scraper._stat_keys_for_category("j1")) == set(scraper.STAT_NAME_MAP)
-    assert set(scraper._stat_keys_for_category("j2")) == (
-        set(scraper.STAT_NAME_MAP) - scraper.J1_ONLY_PHYSICAL_STAT_KEYS
+    assert set(stat_definitions.stat_keys_for_category("j1")) == set(stat_definitions.STAT_NAME_MAP)
+    assert set(stat_definitions.stat_keys_for_category("j2")) == (
+        set(stat_definitions.STAT_NAME_MAP) - stat_definitions.J1_ONLY_PHYSICAL_STAT_KEYS
     )
-    assert "distance" not in scraper._stat_keys_for_category("j3")
+    assert "distance" not in stat_definitions.stat_keys_for_category("j3")
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +61,10 @@ def test_stat_keys_for_category_excludes_physical_for_j2_j3():
 def test_fetch_player_roster(monkeypatch):
     html = load_fixture("player_roster_shimizu.html")
     monkeypatch.setattr(
-        scraper, "_request_with_retry", lambda *args, **kwargs: make_fake_response(html)
+        player_stats, "request_with_retry", lambda *args, **kwargs: make_fake_response(html)
     )
 
-    players = scraper._fetch_player_roster("2026-27", "j1", "shimizu")
+    players = player_stats.fetch_player_roster("2026-27", "j1", "shimizu")
 
     assert len(players) == 54
     assert players[0] == {
@@ -78,12 +80,12 @@ def test_fetch_player_roster(monkeypatch):
 
 def test_fetch_player_roster_raises_on_unexpected_html(monkeypatch):
     monkeypatch.setattr(
-        scraper,
-        "_request_with_retry",
+        player_stats,
+        "request_with_retry",
         lambda *args, **kwargs: make_fake_response("<html>想定外のページ</html>"),
     )
     with pytest.raises(RuntimeError):
-        scraper._fetch_player_roster("2026-27", "j1", "shimizu")
+        player_stats.fetch_player_roster("2026-27", "j1", "shimizu")
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +94,10 @@ def test_fetch_player_roster_raises_on_unexpected_html(monkeypatch):
 def test_fetch_team_stat_ranking(monkeypatch):
     html = load_fixture("team_ranking_score_shimizu.html")
     monkeypatch.setattr(
-        scraper, "_request_with_retry", lambda *args, **kwargs: make_fake_response(html)
+        player_stats, "request_with_retry", lambda *args, **kwargs: make_fake_response(html)
     )
 
-    values = scraper._fetch_team_stat_ranking("2026-27", "j1", "shimizu", "score")
+    values = player_stats.fetch_team_stat_ranking("2026-27", "j1", "shimizu", "score")
 
     assert values["1503986"] == 2
     assert all(isinstance(value, (int, float)) for value in values.values())
@@ -103,12 +105,12 @@ def test_fetch_team_stat_ranking(monkeypatch):
 
 def test_fetch_team_stat_ranking_raises_when_marker_missing(monkeypatch):
     monkeypatch.setattr(
-        scraper,
-        "_request_with_retry",
+        player_stats,
+        "request_with_retry",
         lambda *args, **kwargs: make_fake_response("<html></html>"),
     )
     with pytest.raises(RuntimeError):
-        scraper._fetch_team_stat_ranking("2026-27", "j1", "shimizu", "score")
+        player_stats.fetch_team_stat_ranking("2026-27", "j1", "shimizu", "score")
 
 
 # ---------------------------------------------------------------------------
@@ -121,9 +123,9 @@ def test_team_name_map(monkeypatch):
         def get(self, url, **kwargs):
             return make_fake_response(html)
 
-    monkeypatch.setattr(scraper, "_get_session", lambda: FakeSession())
+    monkeypatch.setattr(team_names, "get_session", lambda: FakeSession())
 
-    name_map = scraper._team_name_map("2026-27", "j1")
+    name_map = team_names._team_name_map("2026-27", "j1")
 
     assert name_map["kashima"] == "鹿島アントラーズ"
     assert name_map["shimizu"] == "清水エスパルス"
@@ -141,8 +143,8 @@ def test_parse_player_detailed_stats_uses_requested_season():
     """
     html = load_fixture("player_1503986.html")
 
-    stats_2026 = scraper._parse_player_detailed_stats(html, "2026-27")
-    stats_2025 = scraper._parse_player_detailed_stats(html, "2025")
+    stats_2026 = player_stats._parse_player_detailed_stats(html, "2026-27")
+    stats_2025 = player_stats._parse_player_detailed_stats(html, "2025")
 
     assert stats_2026["time"] == 499
     assert stats_2025["time"] == 1468
@@ -153,10 +155,10 @@ def test_parse_player_detailed_stats_uses_requested_season():
 def test_fetch_player_history_stats(monkeypatch):
     html = load_fixture("player_1503986.html")
     monkeypatch.setattr(
-        scraper, "_request_with_retry", lambda *args, **kwargs: make_fake_response(html)
+        player_stats, "request_with_retry", lambda *args, **kwargs: make_fake_response(html)
     )
 
-    stats = scraper._fetch_player_history_stats("1503986", "2026-27")
+    stats = player_stats.fetch_player_history_stats("1503986", "2026-27")
 
     # 出場試合数は試合履歴から、詳細スタッツは個人ページから補完される
     assert stats["game"] == 8

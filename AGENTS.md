@@ -2,7 +2,7 @@
 
 ## Project Structure
 
-This repository is a small Python command-line scraper for J.League player statistics. `main.py` handles the CLI and interactive flow, `scraper.py` fetches and parses official site data, and `output.py` writes CSV files. `README.md` documents usage and supported seasons. `requirements.txt` lists runtime dependencies. There is no dedicated test or asset directory; generated CSVs belong in output directories and should not be committed unless specifically needed as fixtures.
+This repository is a small Python command-line scraper for J.League player statistics. `main.py` handles the CLI and interactive flow; `scraper.py` orchestrates one team's collection; `player_stats.py` fetches and parses player lists, rankings, and player pages; `team_names.py` resolves club slugs to names; `http_client.py` performs HTTP requests with retries; `stat_definitions.py` holds the stat codes, position rules, and season constants; and `output.py` writes CSV files. `README.md` documents usage and supported seasons. `requirements.txt` lists runtime dependencies and `requirements-dev.txt` adds pytest. Tests live in `tests/` (with page excerpts in `tests/fixtures/`); generated CSVs belong in output directories and should not be committed.
 
 ## Development Commands
 
@@ -16,7 +16,7 @@ Scraping requires network access to the J.League site and may take several minut
 
 ## Coding Style
 
-Use Python 3.12 or newer, four spaces for indentation, and descriptive `snake_case` names for functions and variables. Keep CLI validation and user-facing messages in `main.py`, site retrieval/parsing in `scraper.py`, and CSV formatting/writing in `output.py`. Follow nearby code patterns and keep CSV headers and output filenames consistent with the Japanese labels documented in `README.md`. No formatter or linter is configured.
+Use Python 3.12 or newer, four spaces for indentation, and descriptive `snake_case` names for functions and variables. Keep CLI validation and user-facing messages in `main.py`, HTTP in `http_client.py`, site retrieval/parsing in `player_stats.py`/`team_names.py`, stat definitions in `stat_definitions.py`, collection orchestration in `scraper.py`, and CSV formatting/writing in `output.py`. Follow nearby code patterns and keep CSV headers and output filenames consistent with the Japanese labels documented in `README.md`. No formatter or linter is configured.
 
 ## Testing
 
@@ -25,7 +25,7 @@ Run the automated suite from the repository root:
 - `python -m pytest` runs all tests in `tests/`.
 - `pip install -r requirements-dev.txt` installs pytest alongside runtime deps.
 
-Tests must not touch the network. HTTP access is stubbed by monkeypatching `scraper._request_with_retry` and `scraper._get_session`; parser tests use trimmed real-page HTML under `tests/fixtures/`. Add new parser/CSV cases when changing parsing or output behavior, and keep each test focused. When a change touches retrieval or CSV behavior beyond the suite, still do a narrow manual check (`--team <one team> --stats <a few>`) and inspect the generated CSV and error log. Avoid unnecessary broad scrapes; they make many network requests.
+Tests must not touch the network. HTTP access is stubbed by monkeypatching `http_client.request_with_retry` / `http_client.get_session` (or the `request_with_retry`/`get_session` imported into the module under test); parser tests use trimmed real-page HTML under `tests/fixtures/`. Add new parser/CSV cases when changing parsing or output behavior, and keep each test focused. When a change touches retrieval or CSV behavior beyond the suite, still do a narrow manual check (`--team <one team> --stats <a few>`) and inspect the generated CSV and error log. Avoid unnecessary broad scrapes; they make many network requests.
 
 ## Commits and Pull Requests
 
