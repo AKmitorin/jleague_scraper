@@ -41,6 +41,7 @@ def write_stat_failure_log(output_dir, year, category, team, failures):
         writer = csv.writer(csv_file)
         writer.writerow(["チーム", "選手名", "選手URL", "項目", "理由"])
         writer.writerows(failures)
+    return filepath
 
 
 def write_stats_csv(
