@@ -515,7 +515,11 @@ def _parse_player_detailed_stats(html, season):
     if season_start < 0:
         raise RuntimeError(f"対象シーズンの詳細スタッツが見つかりません: {season_key}")
     season_start += len(season_marker)
-    next_season = re.search(r'},\"\d{4}-\d+\":{', html[season_start:])
+    # シーズンの区切りはペイロード上 `},\"2026-249\":{` のようにバックスラッシュで
+    # エスケープされる。旧パターンはエスケープされていない `},"2026-249":{` しか
+    # 検出できず、複数シーズンを持つ選手で常に最終シーズンの値が使われていた。
+    # エスケープの有無どちらでも次シーズンの開始位置を検出できるようにする。
+    next_season = re.search(r'},\\?"\d{4}-\d+\\?":\{', html[season_start:])
     season_data = html[season_start:season_start + next_season.start()] if next_season else html[season_start:]
 
     token_to_stat = {
