@@ -146,6 +146,7 @@ def test_collect_appearances_skips_personal_page_for_absent_player(monkeypatch, 
     assert rows[0]["_absent_from_current_list"] is True
     assert rows[0]["game"] == 4
     assert stub.calls["history"] == []
+    assert stub.calls["failure_log"] == [[]]  # 意図的な省略は失敗ログに出さない
 
 
 def test_collect_appearances_absent_player_without_ranking_stays_unknown(monkeypatch, tmp_path):
@@ -158,7 +159,8 @@ def test_collect_appearances_absent_player_without_ranking_stays_unknown(monkeyp
 
     assert rows[0]["score"] is None           # 省略したので0とはみなさない
     assert stub.calls["history"] == []
-    assert len(stub.calls["failure_log"][0]) == 1  # 未取得として記録される
+    # 取得失敗ではないので、失敗ログには出さない
+    assert stub.calls["failure_log"] == [[]]
 
 
 # ---------------------------------------------------------------------------
