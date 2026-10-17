@@ -89,10 +89,9 @@ def collect_appearances(year, category, team, output_dir="output", selected_stat
             player_stats = {
                 key: None for key in STAT_NAME_MAP
             }
-            fetch_error = (
-                None if ranking_only
-                else "現行J1/J2/J3選手一覧に掲載なしのため個人ページ取得を省略"
-            )
+            # 現行一覧にない選手は「意図的に個人ページを省略」しているだけで、取得失敗ではない。
+            # そのため失敗ログ（およびエラーCSV）には出さず、未取得は通常CSVの "-" として残す。
+            fetch_error = None
             player_page_failed = absent_from_current_list
         else:
             try:
