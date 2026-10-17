@@ -3,6 +3,8 @@
 [Jリーグ公式サイト](https://www.jleague.jp)から選手の個人スタッツを取得し、Excelで開きやすい形式のCSVに出力するPythonツールです。  
 チーム単位だけでなく、リーグ全体の全選手データの取得にも対応しています。
 
+[![tests](https://github.com/AKmitorin/jleague_scraper/actions/workflows/tests.yml/badge.svg)](https://github.com/AKmitorin/jleague_scraper/actions/workflows/tests.yml)
+
 ## まずは最短で動かす（Windows向け）
 
 1. Pythonをインストール（未導入の場合）  

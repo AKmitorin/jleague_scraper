@@ -1,0 +1,38 @@
+name: tests
+
+# push と Pull Request のたびに実行する。workflow_dispatch を付けると
+# Actions タブから手動実行もできる。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# リポジトリの読み取りだけで足りるので、権限を最小限にする。
+permissions:
+  contents: read
+
+# 同じブランチで連続 push したとき、古い実行をキャンセルして無駄を省く。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v5
+
+      - name: Python をセットアップ
+        uses: actions/setup-python@v7
+        with:
+          # README 記載の最低サポートバージョンに合わせる
+          python-version: "3.12"
+          # pip のダウンロードをキャッシュして2回目以降を速くする
+          cache: pip
+
+      - name: 依存関係をインストール
+        run: pip install -r requirements-dev.txt
+
+      - name: テストを実行
+        run: python -m pytest -v
