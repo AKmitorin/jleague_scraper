@@ -1,6 +1,8 @@
 venv/
+.venv/
 output/
 data/
 mise.toml
 __pycache__/
 *.py[cod]
+.pytest_cache/
