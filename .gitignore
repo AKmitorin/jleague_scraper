@@ -7,6 +7,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# yomiyasu skill (third-party, not committed) and its check records
-.opencode/skills/yomiyasu/
+# yomiyasu check records (skill 本体は ~/.config/opencode/skills/ に置く)
 .yomiyasu/
