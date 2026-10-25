@@ -1,3 +1,17 @@
+[project]
+name = "jleague-scraper"
+version = "0.1.0"
+description = "Jリーグ公式サイトから選手スタッツを取得してCSVに出力するツール"
+requires-python = ">=3.12"
+dependencies = ["requests>=2.31"]
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+# アプリケーションなので、プロジェクト自身は環境にインストールしない
+[tool.uv]
+package = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

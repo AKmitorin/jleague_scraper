@@ -7,28 +7,31 @@
 
 ## セットアップ
 
-1. Python 3.12以上をインストール（未導入の場合）
+1. [uv](https://docs.astral.sh/uv/) をインストール（未導入の場合）
 2. 任意のフォルダで以下を1行ずつ実行
 
 ```shell
 git clone https://github.com/AKmitorin/jleague_scraper
 cd jleague_scraper
-pip install -r requirements.txt
-py main.py
+uv sync
+uv run main.py
 ```
 
+- `uv sync` が Python 3.12以上と依存パッケージを `.venv/` にまとめて用意します。Pythonを別途インストールする必要はありません。
 - 引数なしで実行すると、対話式ウィザードが起動します。質問に答えるだけでOKです。
-- Mac・Linuxでは `py` コマンドを `python3` に置き換えてください。以下で紹介する使い方についても同様です。
+- `uv run` は `.venv/` のPythonで実行するため、仮想環境の有効化（`source .venv/bin/activate` など）は不要です。以下の例もすべて `uv run` で実行します。
 - Windowsではエクスプローラー上で `run_windows.bat` をダブルクリックしても起動できます。
 
 ## テスト
 
-`tests/` に pytest のテストがあります。開発用の依存を入れて実行します。
+`tests/` に pytest のテストがあります。開発用の依存は `uv sync` で入ります。
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest
+uv sync
+uv run pytest
 ```
+
+依存パッケージを追加するときは `uv add <パッケージ名>`（開発用は `uv add --dev <パッケージ名>`）を使い、更新された `uv.lock` もコミットしてください。
 
 テストはネットワークへアクセスしません。`tests/fixtures/` に置いた実際のページHTMLの抜粋で解析処理を検証し、ダミーのセッションでHTTPリトライを検証します。
 
@@ -52,7 +55,7 @@ python -m pytest
 ### 対話式ウィザード（初心者向け）
 
 ```shell
-py main.py
+uv run main.py
 ```
 
 > 途中で `all` を選ぶと全チーム取得となり、10〜15分程度かかる場合があります。
@@ -60,7 +63,7 @@ py main.py
 ### 引数を指定する
 
 ```shell
-py main.py --season 2026 --category j1 --team shimizu --output output
+uv run main.py --season 2026 --category j1 --team shimizu --output output
 ```
 
 引数ありのときに省略した引数は、「パラメータ」表に示すデフォルト値が使われます。
@@ -76,10 +79,10 @@ py main.py --season 2026 --category j1 --team shimizu --output output
 - `--stats` を省略すると全項目を取得対象にします（J2/J3では非公開項目を除きます）。特定項目だけ取得する場合は、項目コードをカンマ区切りで指定します。
 
 ```shell
-py main.py --season 2026 --category j1 --team shimizu
-py main.py --season 2026 --category j1 --team shimizu --stats game,score,assist
-py main.py --season 2026-27 --category j1 --team shimizu
-py main.py --season 2026-27 --category j2 --team yokohamafc
+uv run main.py --season 2026 --category j1 --team shimizu
+uv run main.py --season 2026 --category j1 --team shimizu --stats game,score,assist
+uv run main.py --season 2026-27 --category j1 --team shimizu
+uv run main.py --season 2026-27 --category j2 --team yokohamafc
 ```
 
 CSVには対象チームの選手一覧とスタッツを出力します。スタッツは公式ページの表示に合わせてリーグ戦の成績です。
@@ -90,7 +93,7 @@ CSVには対象チームの選手一覧とスタッツを出力します。ス�
 ### チーム一覧を表示
 
 ```shell
-py main.py --list-teams --season 2025 --category j1
+uv run main.py --list-teams --season 2025 --category j1
 ```
 
 ### スタッツ項目コードを表示
@@ -98,14 +101,14 @@ py main.py --list-teams --season 2025 --category j1
 `--stats` に指定できるコードと日本語名を確認できます。J2/J3では、取得可能な項目だけを表示します。
 
 ```shell
-py main.py --list-stats --category j1
-py main.py --list-stats --category j2
+uv run main.py --list-stats --category j1
+uv run main.py --list-stats --category j2
 ```
 
 ### 現行Jリーグ一覧にない過去選手を一覧
 
 ```shell
-py main.py --list-inactive-players --season 2020 --category j1 --team shimizu
+uv run main.py --list-inactive-players --season 2020 --category j1 --team shimizu
 ```
 
 J1/J2/J3すべての現行選手一覧と照合し、該当選手を `output/players_not_current_<チーム>_<シーズン>_<カテゴリ>.csv` に出力します。`--team all` を指定すると、そのシーズン・カテゴリの全チームを対象にします。
@@ -183,8 +186,10 @@ https://www.jleague.jp/stats/{j1|j2|j3}/player/{year}/{team_id}/{stats_category}
 
 ## よくある失敗
 
-- `py`, `python3` コマンドが動かない  
-  Pythonがインストールされていない可能性があります。Python 3.12以上を入れてから再実行してください。
+- `uv: command not found` と表示される  
+  uvがインストールされていません。[uvの公式サイト](https://docs.astral.sh/uv/)の手順でインストールしてから再実行してください。
+- `ModuleNotFoundError: No module named 'requests'` と表示される  
+  `uv sync` を実行せずに `uv run` したか、`.venv/` が壊れています。`uv sync` を実行し直してください。
 - `チーム一覧の取得に失敗しました`  
   ネットワークが不安定な場合に発生します。時間をおいて再実行してください。
 - `... ランキング取得失敗 (URL: ...)` と表示されて止まる  
