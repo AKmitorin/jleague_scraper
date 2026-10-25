@@ -23,16 +23,16 @@ jobs:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v5
 
-      - name: Python をセットアップ
-        uses: actions/setup-python@v7
+      - name: uv をセットアップ
+        uses: astral-sh/setup-uv@v10
         with:
           # README 記載の最低サポートバージョンに合わせる
           python-version: "3.12"
-          # pip のダウンロードをキャッシュして2回目以降を速くする
-          cache: pip
+          # uv がダウンロードしたパッケージをキャッシュして2回目以降を速くする
+          enable-cache: true
 
       - name: 依存関係をインストール
-        run: pip install -r requirements-dev.txt
+        run: uv sync --locked
 
       - name: テストを実行
-        run: python -m pytest -v
+        run: uv run pytest -v
